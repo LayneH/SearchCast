@@ -93,6 +93,19 @@ python optuna_ridge.py \
 | `--fixed_noise_type` | `None` | Fix augmentation: `none`, `time`, `freq`, or `None` (search) |
 | `--fixed_aug_sigma` | `None` | Fix augmentation intensity (disables search) |
 
+### Benchmark / Debug Controls
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--trial_log` | `None` | Write one CSV row per finished Optuna trial (params, val MSE, per-alpha MSE) |
+| `--profile` | `False` | Record coarse per-stage timings (prep/gram/solve/predict) to `profile.json`; adds CUDA syncs |
+| `--horizon_subset` | `None` | Comma-separated horizon-group indices to search; skips the global baseline and alignment stages |
+
+`scripts/bench_parity.py` drives these for performance work: `run` executes a
+reduced representative slice and records wall time + per-trial results,
+`compare` checks two runs for val-MSE / chosen-alpha parity, and `selftest`
+runs numerical unit checks on the solver and data pipeline.
+
 ## Architecture
 
 ### Data Pipeline

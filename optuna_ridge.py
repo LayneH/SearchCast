@@ -286,14 +286,33 @@ class RidgeSolver:
     def __init__(self, device):
         self.device = device
 
+    @staticmethod
+    def _iter_row_chunks(X, Y, chunk_size):
+        """Yield 2D (rows, L) / (rows, H) chunks from 2D (N, ...) or 3D (S, N, ...) inputs.
+
+        3D inputs are consumed in series-major order, i.e. equivalent to
+        X.reshape(-1, L) without materializing the flattened copy (the windowed
+        views produced by unfold cannot be reshaped for free).
+        """
+        if X.dim() == 2:
+            for start in range(0, X.shape[0], chunk_size):
+                end = min(start + chunk_size, X.shape[0])
+                yield X[start:end], (Y[start:end] if Y is not None else None)
+        else:
+            for s in range(X.shape[0]):
+                for start in range(0, X.shape[1], chunk_size):
+                    end = min(start + chunk_size, X.shape[1])
+                    yield X[s, start:end], (Y[s, start:end] if Y is not None else None)
+
     @torch.no_grad()
     def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
         """
         Solve ridge regression for multiple alpha values.
 
         Args:
-            X_train: (N, L) input features
-            Y_train: (N, H) targets
+            X_train: (N, L) or (S, N_s, L) input features (3D is treated as the
+                     pooled row-concatenation of the S series)
+            Y_train: (N, H) or (S, N_s, H) targets
             alphas: (K,) regularization strengths
             scaler: normalization scaler (LocalNormScaler or GlobalScaler or None)
                     - LocalNormScaler: per-sample normalization, appends scale feature, no intercept
@@ -306,8 +325,8 @@ class RidgeSolver:
         Returns:
             Theta: (K, F, H) weight matrices for each alpha
         """
-        N, L = X_train.shape
-        _, H = Y_train.shape
+        L = X_train.shape[-1]
+        H = Y_train.shape[-1]
         K = alphas.shape[0]
 
         # Determine feature dimension and intercept based on scaler type
@@ -323,10 +342,9 @@ class RidgeSolver:
         XTY = torch.zeros(F, H, device=self.device, dtype=dtype)
 
         with PROFILER.stage("gram"):
-            for start in range(0, N, chunk_size):
-                end = min(start + chunk_size, N)
-                X_chunk = X_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                Y_chunk = Y_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+            for X_chunk, Y_chunk in self._iter_row_chunks(X_train, Y_train, chunk_size):
+                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
 
                 if use_local_norm:
                     # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
@@ -351,34 +369,58 @@ class RidgeSolver:
                 XTX.add_(X_chunk.T @ X_chunk)
                 XTY.add_(X_chunk.T @ Y_chunk)
 
-        XTX_expanded = XTX.unsqueeze(0).expand(K, -1, -1)
-
-        # Create regularization matrix
-        if fit_intercept:
-            # Don't regularize the intercept term
-            reg_diags = alphas.unsqueeze(1).expand(-1, F).clone()
-            reg_diags[:, 0] = 0.0
-        else:
-            # Regularize all features (LocalNormScaler case)
-            reg_diags = alphas.unsqueeze(1).expand(-1, F)
-        I_reg = torch.diag_embed(reg_diags)
-
-        A = XTX_expanded + I_reg
-        B = XTY.unsqueeze(0).expand(K, -1, -1)
-
-        # Solve Linear System
         with PROFILER.stage("solve"):
+            Theta = self._solve_alpha_chunked(XTX, XTY, alphas, fit_intercept)
+        return Theta
+
+    def _solve_alpha_chunked(self, XTX, XTY, alphas, fit_intercept, alpha_chunk_size=None):
+        """
+        Solve (XTX + alpha*D) Theta = XTY for every alpha, chunking over alphas
+        so the transient (Kb, ..., F, F) factorization workspace stays bounded
+        instead of materializing all K systems at once.
+
+        D = diag(0, 1, ..., 1) when fit_intercept else the identity.
+
+        Args:
+            XTX: (F, F) or (Sb, F, F) Gram matrices
+            XTY: (F, H) or (Sb, F, H) cross-products
+            alphas: (K,) regularization strengths
+
+        Returns:
+            Theta: (K, F, H) or (K, Sb, F, H), same device/dtype as XTY
+        """
+        K = alphas.shape[0]
+        F = XTX.shape[-1]
+        batched = XTX.dim() == 3
+        if alpha_chunk_size is None:
+            # ~1GB budget for A plus its Cholesky factor per chunk
+            n_systems = XTX.shape[0] if batched else 1
+            per_alpha = 2 * n_systems * F * F * XTX.element_size()
+            alpha_chunk_size = max(1, min(K, (1 << 30) // max(1, per_alpha)))
+
+        Theta = torch.empty((K,) + XTY.shape, device=XTY.device, dtype=XTY.dtype)
+        for k0 in range(0, K, alpha_chunk_size):
+            k1 = min(k0 + alpha_chunk_size, K)
+            alpha_chunk = alphas[k0:k1].to(device=XTX.device, dtype=XTX.dtype)
+            if batched:
+                diag_vals = alpha_chunk.view(-1, 1, 1).expand(k1 - k0, XTX.shape[0], F).clone()
+                if fit_intercept:
+                    diag_vals[:, :, 0] = 0.0  # don't regularize the intercept
+            else:
+                diag_vals = alpha_chunk.view(-1, 1).expand(k1 - k0, F).clone()
+                if fit_intercept:
+                    diag_vals[:, 0] = 0.0
+            A = XTX.unsqueeze(0) + torch.diag_embed(diag_vals)
+            B = XTY.unsqueeze(0).expand((k1 - k0,) + XTY.shape)
+
             try:
                 Lchol = torch.linalg.cholesky(A)
-                Theta = torch.cholesky_solve(B, Lchol)  # (K, F, H)
+                Theta[k0:k1] = torch.cholesky_solve(B, Lchol)
             except RuntimeError:
                 try:
-                    Theta = torch.linalg.solve(A, B)
+                    Theta[k0:k1] = torch.linalg.solve(A, B)
                 except RuntimeError:
-                    XTX_inv = torch.linalg.pinv(A)
-                    Theta = torch.einsum('kij,kjh->kih', XTX_inv, B)
-
-        torch.cuda.empty_cache()
+                    Theta[k0:k1] = torch.linalg.pinv(A) @ B
         return Theta
 
     @torch.no_grad()
@@ -387,7 +429,8 @@ class RidgeSolver:
         Make predictions using trained weights.
 
         Args:
-            X: (N, L) input features (raw, before any normalization)
+            X: (N, L) or (S, N_s, L) input features (raw, before any normalization);
+               3D input is consumed in series-major order and returned flattened
             theta: (K, F, H) weight matrices
             scaler: normalization scaler (LocalNormScaler or GlobalScaler or None)
                     - LocalNormScaler: fit, transform (appends scale), predict, inv_transform
@@ -397,9 +440,8 @@ class RidgeSolver:
             dtype: computation dtype
 
         Returns:
-            Y_pred: (K, N, H) predictions
+            Y_pred: (K, N_total, H) predictions on the solver device
         """
-        N = X.shape[0]
         K, _, H = theta.shape
         theta = theta.to(dtype=dtype, device=self.device, non_blocking=True)
 
@@ -408,9 +450,8 @@ class RidgeSolver:
         # Process in chunks for memory efficiency
         with PROFILER.stage("predict"):
             Y_pred_chunks = []
-            for start in range(0, N, chunk_size):
-                end = min(start + chunk_size, N)
-                X_chunk = X[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+            for X_chunk, _ in self._iter_row_chunks(X, None, chunk_size):
+                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
 
                 if use_local_norm:
                     # LocalNormScaler: fit, transform, predict, then inv_transform
@@ -426,10 +467,96 @@ class RidgeSolver:
                     X_chunk = torch.cat([ones, X_chunk], dim=1)
                     Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta)
 
-                Y_pred_chunks.append(Y_pred_chunk.cpu())
+                Y_pred_chunks.append(Y_pred_chunk)
 
-            Y_pred = torch.cat(Y_pred_chunks, dim=1).to(self.device)
+            Y_pred = torch.cat(Y_pred_chunks, dim=1)
         return Y_pred
+
+    def _predict_chunk(self, X_chunk, theta, scaler, dtype):
+        """Transform one raw (rows, L) chunk, apply theta, undo the normalization.
+
+        Unlike predict(), this also applies the GlobalScaler inverse so the
+        result is always in the original data scale.
+        """
+        if isinstance(scaler, LocalNormScaler):
+            scaler.fit(X_chunk)
+            X_t = scaler.transform(X_chunk)
+            pred = torch.einsum('nf, kfh -> knh', X_t, theta)
+            return scaler.inv_transform(pred)
+        if scaler is not None:
+            X_chunk = scaler.transform(X_chunk)
+        ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+        X_t = torch.cat([ones, X_chunk], dim=1)
+        pred = torch.einsum('nf, kfh -> knh', X_t, theta)
+        if isinstance(scaler, GlobalScaler):
+            pred = scaler.inv_transform(pred)
+        return pred
+
+    @torch.no_grad()
+    def val_mse(self, X, Y, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+        """
+        Fused validation MSE per alpha: prediction and squared error in one
+        chunked pass, never materializing the (K, N, H) prediction tensor and
+        never leaving the solver device until the final (K,) vector.
+
+        Equivalent to predict() -> inv_transform -> ((pred - Y)**2).mean((-2,-1)).
+
+        Args:
+            X: (N, L) or (S, N_s, L) raw validation inputs
+            Y: (N, H) or (S, N_s, H) raw validation targets
+            theta: (K, F, H) weight matrices
+
+        Returns:
+            mse_per_alpha: (K,) tensor on CPU
+        """
+        K = theta.shape[0]
+        H = Y.shape[-1]
+        theta = theta.to(dtype=dtype, device=self.device, non_blocking=True)
+
+        sse = torch.zeros(K, device=self.device, dtype=dtype)
+        n_rows = 0
+        with PROFILER.stage("predict"):
+            for X_chunk, Y_chunk in self._iter_row_chunks(X, Y, chunk_size):
+                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
+                pred = self._predict_chunk(X_chunk, theta, scaler, dtype)
+                sse += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1))
+                n_rows += X_chunk.shape[0]
+        return (sse / (n_rows * H)).cpu()
+
+    @torch.no_grad()
+    def val_mse_batched(self, X_batch, Y_batch, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+        """
+        Fused validation MSE for per-series models: per-series MSE averaged
+        across series, per alpha.
+
+        Equivalent to predict_batched() -> inv_transform ->
+        mean over (N, H) per series -> mean over series.
+
+        Args:
+            X_batch: (S, N_s, L) raw validation inputs
+            Y_batch: (S, N_s, H) raw validation targets
+            theta: (K, S, F, H) weight matrices
+
+        Returns:
+            mse_per_alpha: (K,) tensor on CPU
+        """
+        S, N_s, _ = X_batch.shape
+        K = theta.shape[0]
+        H = Y_batch.shape[-1]
+
+        sse = torch.zeros(K, S, device=self.device, dtype=dtype)
+        with PROFILER.stage("predict"):
+            for s in range(S):
+                theta_s = theta[:, s].to(dtype=dtype, device=self.device, non_blocking=True)
+                for start in range(0, N_s, chunk_size):
+                    end = min(start + chunk_size, N_s)
+                    X_chunk = X_batch[s, start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                    Y_chunk = Y_batch[s, start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                    pred = self._predict_chunk(X_chunk, theta_s, scaler, dtype)
+                    sse[:, s] += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1))
+        mse_per_series = sse / (N_s * H)  # (K, S)
+        return mse_per_series.mean(dim=1).cpu()
 
     @torch.no_grad()
     def solve_batched(self, X_train_batch, Y_train_batch, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
@@ -449,7 +576,7 @@ class RidgeSolver:
             dtype: computation dtype
 
         Returns:
-            Theta: (K, S, F, H) weight matrices on CPU
+            Theta: (K, S, F, H) weight matrices on the solver device
         """
         S, N_s, L = X_train_batch.shape
         _, _, H = Y_train_batch.shape
@@ -464,15 +591,16 @@ class RidgeSolver:
             F = L + 1  # features + intercept
             fit_intercept = True
 
-        # Theta on CPU — results are read by predict_batched which also works per-series
-        Theta = torch.zeros(K, S, F, H, dtype=dtype)
+        Theta = torch.zeros(K, S, F, H, device=self.device, dtype=dtype)
 
         # Determine series_batch: must fit Gram matrices + at least 1 alpha solve
         # Gram: Sb * (F*F + F*H) * 8 bytes for XTX + XTY
         # Solve (min): 1 * Sb * F*F * 8 * 3 bytes for A, L, workspace
-        torch.cuda.empty_cache()
-        free_mem, _ = torch.cuda.mem_get_info(self.device)
-        gpu_budget = int(free_mem * 0.7)
+        if self.device.type == "cuda":
+            free_mem, _ = torch.cuda.mem_get_info(self.device)
+            gpu_budget = int(free_mem * 0.7)
+        else:
+            gpu_budget = 4 << 30  # fixed working budget on CPU
         bytes_per_series = (F * F + F * H + F * F * 3) * 8  # Gram + 1-alpha solve
         series_batch = max(1, min(S, gpu_budget // bytes_per_series))
 
@@ -511,43 +639,12 @@ class RidgeSolver:
                         XTX[si].add_(X_chunk.T @ X_chunk)
                         XTY[si].add_(X_chunk.T @ Y_chunk)
 
-            # --- Phase 2: Solve for all alphas, adaptively batched ---
-            # Re-query free memory after Gram allocation
-            torch.cuda.empty_cache()
-            free_mem2, _ = torch.cuda.mem_get_info(self.device)
-            solve_budget = int(free_mem2 * 0.7)
-            # Each alpha in this batch needs Sb * F * F * 8 * 3 bytes
-            solve_bytes_per_alpha = Sb * F * F * 8 * 3
-            alpha_batch = max(1, min(K, solve_budget // max(1, solve_bytes_per_alpha)))
-
+            # --- Phase 2: Solve for all alphas, chunked over alphas ---
             with PROFILER.stage("solve"):
-                for k_start in range(0, K, alpha_batch):
-                    k_end = min(k_start + alpha_batch, K)
-                    Kb = k_end - k_start
-                    alpha_chunk = alphas[k_start:k_end]
-
-                    diag_vals = alpha_chunk.view(Kb, 1, 1).expand(Kb, Sb, F).clone()
-                    if fit_intercept:
-                        diag_vals[:, :, 0] = 0.0
-                    I_reg = torch.diag_embed(diag_vals)
-
-                    A = XTX.unsqueeze(0).expand(Kb, -1, -1, -1) + I_reg  # (Kb, Sb, F, F)
-                    B = XTY.unsqueeze(0).expand(Kb, -1, -1, -1).clone()  # (Kb, Sb, F, H)
-
-                    try:
-                        L = torch.linalg.cholesky(A)
-                        Theta[k_start:k_end, s_start:s_end] = torch.cholesky_solve(B, L).cpu()
-                    except RuntimeError:
-                        try:
-                            Theta[k_start:k_end, s_start:s_end] = torch.linalg.solve(A, B).cpu()
-                        except RuntimeError:
-                            A_inv = torch.linalg.pinv(A)
-                            Theta[k_start:k_end, s_start:s_end] = torch.einsum('ksij,ksjh->ksih', A_inv, B).cpu()
-
-                    del A, B, I_reg, diag_vals
+                Theta[:, s_start:s_end] = self._solve_alpha_chunked(
+                    XTX, XTY, alphas, fit_intercept)
 
             del XTX, XTY
-            torch.cuda.empty_cache()
 
         return Theta
 
@@ -568,7 +665,6 @@ class RidgeSolver:
         """
         S, N_s, L = X_batch.shape
         K, _, _, H = theta.shape
-        # theta stays on CPU; load per-series to GPU to avoid large GPU allocation
 
         use_local_norm = isinstance(scaler, LocalNormScaler)
 
@@ -600,12 +696,12 @@ class RidgeSolver:
                         X_chunk = torch.cat([ones, X_chunk], dim=1)
                         Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta_s)
 
-                    Y_pred_chunks.append(Y_pred_chunk.cpu())
+                    Y_pred_chunks.append(Y_pred_chunk)
 
                 Y_pred_s = torch.cat(Y_pred_chunks, dim=1)  # (K, N_s, H)
                 Y_pred_all.append(Y_pred_s)
 
-            Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H) — stays on CPU
+            Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H)
         return Y_pred
 
 # ==========================================
@@ -614,10 +710,10 @@ class RidgeSolver:
 def get_context_and_horizons(data, lookback, horizons):
     if isinstance(horizons, int):
         H_max = horizons
-        idx_tensor = torch.tensor([horizons], dtype=torch.long)
+        idx_tensor = torch.tensor([horizons], dtype=torch.long, device=data.device)
     else:
         H_max = max(horizons)
-        idx_tensor = torch.tensor(horizons, dtype=torch.long)
+        idx_tensor = torch.tensor(horizons, dtype=torch.long, device=data.device)
 
     # Dynamic Window: lookback + max_horizon required
     window_size = lookback + H_max
@@ -678,9 +774,12 @@ def maybe_transform(X: torch.Tensor, scaler, force_no_fit: bool = False):
 
 
 def get_prepared_data(series_data, lookback, horizons, split_idx_1, split_idx_2,
-                      scaler_config):
+                      scaler_config, include_val=True, include_test=True):
     """
     Prepare train/val/test data with appropriate scalers.
+
+    include_val/include_test skip building window sets the caller will not use
+    (fold evaluation never touches test windows; refit never touches val).
 
     Returns:
         X_train, Y_train, X_val, Y_val, X_test, Y_test, scalers_dict
@@ -700,15 +799,18 @@ def get_prepared_data(series_data, lookback, horizons, split_idx_1, split_idx_2,
     X_train, Y_train = get_context_and_horizons(
         series_data[:, :split_idx_1], lookback, horizons)
 
-    if split_idx_2 > split_idx_1:
+    if include_val and split_idx_2 > split_idx_1:
         X_val, Y_val = get_context_and_horizons(
             series_data[:, split_idx_1 - lookback:split_idx_2],
             lookback, horizons)
     else:
         X_val, Y_val = None, None
 
-    X_test, Y_test = get_context_and_horizons(
-        series_data[:, test_slice_start:], lookback, horizons)
+    if include_test:
+        X_test, Y_test = get_context_and_horizons(
+            series_data[:, test_slice_start:], lookback, horizons)
+    else:
+        X_test, Y_test = None, None
 
     # Create scalers
     if scope == 'global':
@@ -770,6 +872,9 @@ class SingleObjectiveWrapper:
             self.data = data[:, series_idx].unsqueeze(0)
             self.is_batched = False
             self.n_series = 1
+        # Keep the (small) series data resident on the compute device so all
+        # windowing/unfold operations below are device-side views.
+        self.data = self.data.to(device).contiguous()
         # Store lookback bounds for log-scale search
         self.min_lookback = min(lookbacks)
         self.max_lookback = max(lookbacks)
@@ -826,7 +931,8 @@ class SingleObjectiveWrapper:
             with PROFILER.stage("prep"):
                 X_train_w, Y_train, X_val_w, Y_val, _, _, scalers = \
                     get_prepared_data(self.data, lookback, self.horizon,
-                                      train_end, val_end, scaler_config)
+                                      train_end, val_end, scaler_config,
+                                      include_test=False)
         except ValueError:
             return None
 
@@ -834,54 +940,27 @@ class SingleObjectiveWrapper:
             return None
 
         if self.is_batched and not self.pool_series:
-            # Batched mode: keep series separate (S, N_s, L)
-            # X_train_w shape: (S, N_windows, L)
-            # Y_train shape: (S, N_windows, H)
-
-            # Solve with batched solver (each series gets own model)
+            # Batched mode: keep series separate (S, N_s, L), one model per series
             Theta = self.solver.solve_batched(
                 X_train_w, Y_train, self.alphas,
                 scaler=scalers['train'],
                 aug_config=aug_config
             )  # (K, S, F, H)
 
-            # Predict per-series (returns CPU tensor to avoid OOM)
-            Y_pred = self.solver.predict_batched(
-                X_val_w, Theta, scaler=scalers['val']
-            )  # (K, S, N_val, H) on CPU
-
-            if isinstance(scalers['val'], GlobalScaler):
-                Y_pred = scalers['val'].inv_transform(Y_pred)
-
-            # Compute MSE on CPU to avoid large GPU allocation
-            # Y_val shape: (S, N_val, H)
-            # Y_pred shape: (K, S, N_val, H)
-            diff = Y_pred - Y_val.cpu().unsqueeze(0)  # (K, S, N_val, H)
-            mse_per_series = (diff ** 2).mean(dim=(-2, -1))  # (K, S)
-            mse_per_alpha = mse_per_series.mean(dim=1)  # (K,) - average across series
+            # Fused per-series validation MSE (never materializes predictions)
+            mse_per_alpha = self.solver.val_mse_batched(
+                X_val_w, Y_val, Theta, scaler=scalers['val'])  # (K,)
         else:
-            # Single series mode: concatenate windows
-            X_train = X_train_w.reshape(-1, lookback)
-            Y_train = Y_train.reshape(-1, Y_train.shape[-1])
-            X_val = X_val_w.reshape(-1, lookback)
-            Y_val = Y_val.reshape(-1, Y_val.shape[-1])
-
-            # Solve
+            # Single-series / pooled mode: windows consumed in series-major
+            # order without materializing a flattened copy
             Theta = self.solver.solve(
-                X_train, Y_train, self.alphas,
+                X_train_w, Y_train, self.alphas,
                 scaler=scalers['train'],
                 aug_config=aug_config
             )
 
-            # Predict
-            Y_pred = self.solver.predict(X_val, Theta, scaler=scalers['val'])
-            if isinstance(scalers['val'], GlobalScaler):
-                Y_pred = scalers['val'].inv_transform(Y_pred)
-            Y_pred = Y_pred.cpu()
-
-            # Compute MSE per alpha
-            diff = Y_pred - Y_val.unsqueeze(0)  # (K, N_window, H)
-            mse_per_alpha = (diff ** 2).mean(dim=(-2, -1))  # (K,)
+            mse_per_alpha = self.solver.val_mse(
+                X_val_w, Y_val, Theta, scaler=scalers['val'])  # (K,)
 
         return mse_per_alpha
 
@@ -1022,51 +1101,50 @@ class SingleObjectiveWrapper:
         end = self.split_ends[1]
         X_train_w, Y_train, _, _, X_test_w, Y_test, scalers = \
             get_prepared_data(self.data, lookback, self.horizon,
-                              start, end, scaler_config)
+                              start, end, scaler_config, include_val=False)
 
         S = self.n_series
         N_test = X_test_w.shape[1] if X_test_w.dim() == 3 else X_test_w.shape[0]
 
-        X_train = X_train_w.reshape(-1, lookback)
-        Y_train = Y_train.reshape(-1, Y_train.shape[-1])
-        X_test = X_test_w.reshape(-1, lookback)
+        # Y windows are contiguous, so this reshape is a view; X windows stay
+        # 3D and are consumed chunk-wise by the solver without flattening.
         Y_test = Y_test.reshape(-1, Y_test.shape[-1])
 
         single_alpha = torch.tensor([best_alpha_val], device=self.device)
 
         # Solve with scaler
         Theta = self.solver.solve(
-            X_train, Y_train, single_alpha,
+            X_train_w, Y_train, single_alpha,
             scaler=scalers['test'],
             aug_config=aug_config,
         )
 
         # Predict with scaler
-        Y_pred = self.solver.predict(X_test, Theta, scaler=scalers['test'])
+        Y_pred = self.solver.predict(X_test_w, Theta, scaler=scalers['test'])
         Y_pred = Y_pred.reshape_as(Y_test)  # (S*N_test, H) or (N_test, H)
 
         # For GlobalScaler, apply inv_transform to get back to original scale
         if isinstance(scalers['test'], GlobalScaler):
             Y_pred = scalers['test'].inv_transform(Y_pred)
-        Y_pred = Y_pred.to(torch.float32).cpu()
+        Y_pred = Y_pred.to(torch.float32)
 
         if self.pool_series and self.is_batched:
             # Reshape to per-series: (S*N_test, H) -> (S, N_test, H)
             H = Y_pred.shape[-1]
             Y_pred = Y_pred.reshape(S, N_test, H)
             Y_test_per = Y_test.reshape(S, N_test, H)
-            per_series_mse = ((Y_pred - Y_test_per)**2).mean(dim=(-2, -1))  # (S,)
+            per_series_mse = ((Y_pred - Y_test_per)**2).mean(dim=(-2, -1)).cpu()  # (S,)
             return {
                 'test_mse': per_series_mse.mean().item(),
                 'per_series_mse': per_series_mse,  # (S,)
-                'raw_preds': Y_pred,  # (S, N_test, H)
+                'raw_preds': Y_pred.cpu(),  # (S, N_test, H)
             }
 
         # Calculate simple mean for logging
         mse = ((Y_pred - Y_test)**2).mean().item()
         return {
             'test_mse': mse,
-            'raw_preds': Y_pred,
+            'raw_preds': Y_pred.cpu(),
         }
 
 class MultiOutputGlobalSeriesObjectiveWrapper:
@@ -1082,7 +1160,7 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
             device: torch device
             use_local_norm: if True, use LocalNormScaler (default True for reference compatibility)
         """
-        self.data = data
+        self.data = data.to(device)
         self.lookback = lookback
         self.horizon = horizons
         self.alphas = alphas
@@ -1107,12 +1185,13 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
         else:
             scaler = None  # No scaler, use intercept
 
-        # Create training windows
+        # Create training windows (device-side views; the solver consumes the
+        # 3D windows chunk-wise without materializing a flattened copy)
         train_wins = self.data[:n_train].transpose(0, 1).unfold(1, L + max_horizon, 1)
         # train_wins shape: (S, N_train_windows, L + max_horizon)
 
-        X_tr = train_wins[:, :, :L].reshape(-1, L)  # (S*N, L)
-        Y_tr = train_wins[:, :, L:L+H].reshape(-1, H)  # (S*N, H)
+        X_tr = train_wins[:, :, :L]  # (S, N, L)
+        Y_tr = train_wins[:, :, L:L+H]  # (S, N, H)
 
         # Solve ridge regression using unified solver
         single_alpha = torch.tensor([self.alphas], device=self.device)
@@ -1127,8 +1206,7 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
         N_test = test_wins.shape[1]
 
         # Predict using unified solver
-        X_te_flat = X_te.reshape(-1, L)  # (S*N_test, L)
-        Y_pred = self.solver.predict(X_te_flat, Theta, scaler=scaler)
+        Y_pred = self.solver.predict(X_te, Theta, scaler=scaler)
 
         # Reshape to (S, N_test, H)
         Y_pred = Y_pred.squeeze(0).reshape(S, N_test, H)
@@ -1292,6 +1370,11 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                   f"α={best['best_alpha']:.2e}, scaler={best['scaler_scope']}, "
                   f"norm={best['scaler_method']}, {aug_str}. "
                   f"Val={best['val_mse']:.4f}, Time={search_elapsed:.2f}s")
+
+        # Release cached allocator blocks once per series group (per-solve
+        # empty_cache calls were removed — they forced a device sync each fit)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Print timing summary
     total_elapsed = time.time() - total_start_time

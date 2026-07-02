@@ -266,10 +266,109 @@ def _selftest_local_norm_solve():
     return "local-norm solve matches dense reference (all features regularized)"
 
 
+def _selftest_pooled_3d_solve():
+    """solve()/predict() on 3D (S, N, L) windows must equal the flattened 2D
+    formulation (pooled model), up to chunk-order rounding."""
+    import torch
+    from optuna_ridge import RidgeSolver, LocalNormScaler, StandardStrategy
+
+    torch.manual_seed(2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    S, N, L, H = 3, 300, 6, 2
+    X3 = torch.randn(S, N, L, dtype=torch.float64)
+    Y3 = torch.randn(S, N, H, dtype=torch.float64)
+    alphas = torch.tensor([1e-2, 10.0], dtype=torch.float64, device=device)
+
+    solver = RidgeSolver(device)
+    for scaler_factory in (lambda: None,
+                           lambda: LocalNormScaler(StandardStrategy(), L, 3)):
+        t3 = solver.solve(X3, Y3, alphas, scaler=scaler_factory(), chunk_size=128)
+        t2 = solver.solve(X3.reshape(-1, L), Y3.reshape(-1, H), alphas,
+                          scaler=scaler_factory(), chunk_size=128)
+        err = (t3 - t2).abs().max().item()
+        assert err < 1e-12, f"3D vs 2D solve differ: {err}"
+
+        p3 = solver.predict(X3, t3, scaler=scaler_factory(), chunk_size=128)
+        p2 = solver.predict(X3.reshape(-1, L), t3, scaler=scaler_factory(), chunk_size=128)
+        err = (p3 - p2).abs().max().item()
+        assert err < 1e-12, f"3D vs 2D predict differ: {err}"
+    return "3D windows == flattened 2D (solve & predict), both scaler paths"
+
+
+def _selftest_fused_val_mse():
+    """val_mse / val_mse_batched must match the unfused predict()+mean reference."""
+    import torch
+    from optuna_ridge import (RidgeSolver, LocalNormScaler, GlobalScaler,
+                              StandardStrategy)
+
+    torch.manual_seed(3)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    S, N, L, H, K = 3, 250, 5, 4, 3
+    X = torch.randn(S, N, L, dtype=torch.float64) + 2
+    Y = torch.randn(S, N, H, dtype=torch.float64) + 2
+    alphas = torch.logspace(-2, 2, K, dtype=torch.float64, device=device)
+    solver = RidgeSolver(device)
+
+    def make_scalers():
+        gs = GlobalScaler(StandardStrategy())
+        gs.fit(X.reshape(1, -1))
+        return [None, LocalNormScaler(StandardStrategy(), L, L), gs]
+
+    # Pooled/single path
+    for scaler in make_scalers():
+        theta = solver.solve(X, Y, alphas, scaler=scaler, chunk_size=97)
+        fused = solver.val_mse(X, Y, theta, scaler=scaler, chunk_size=97)
+        pred = solver.predict(X, theta, scaler=scaler, chunk_size=97)
+        if isinstance(scaler, GlobalScaler):
+            pred = scaler.inv_transform(pred)
+        ref = ((pred.cpu() - Y.reshape(-1, H).unsqueeze(0)) ** 2).mean(dim=(-2, -1))
+        err = (fused - ref).abs().max().item()
+        assert err < 1e-12, f"{type(scaler).__name__}: fused vs ref {err}"
+
+    # Batched (per-series models) path
+    for scaler in make_scalers():
+        theta_b = solver.solve_batched(X, Y, alphas, scaler=scaler, chunk_size=97)
+        fused = solver.val_mse_batched(X, Y, theta_b, scaler=scaler, chunk_size=97)
+        per_series = []
+        for s in range(S):
+            pred = solver.predict(X[s], theta_b[:, s], scaler=scaler, chunk_size=97)
+            if isinstance(scaler, GlobalScaler):
+                pred = scaler.inv_transform(pred)
+            per_series.append(((pred.cpu() - Y[s].unsqueeze(0)) ** 2).mean(dim=(-2, -1)))
+        ref = torch.stack(per_series, dim=1).mean(dim=1)
+        err = (fused - ref).abs().max().item()
+        assert err < 1e-12, f"batched {type(scaler).__name__}: fused vs ref {err}"
+    return "fused val MSE == predict()+mean reference (single & batched, all scalers)"
+
+
+def _selftest_solve_batched_per_series():
+    """solve_batched must equal an independent solve() per series."""
+    import torch
+    from optuna_ridge import RidgeSolver
+
+    torch.manual_seed(4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    S, N, L, H, K = 4, 200, 5, 3, 5
+    X = torch.randn(S, N, L, dtype=torch.float64)
+    Y = torch.randn(S, N, H, dtype=torch.float64)
+    alphas = torch.logspace(-3, 3, K, dtype=torch.float64, device=device)
+    solver = RidgeSolver(device)
+
+    theta_b = solver.solve_batched(X, Y, alphas, scaler=None, chunk_size=64)
+    for s in range(S):
+        theta_s = solver.solve(X[s], Y[s], alphas, scaler=None, chunk_size=64)
+        err = (theta_b[:, s].cpu() - theta_s.cpu()).abs().max().item()
+        assert err < 1e-10, f"series {s}: batched vs single {err}"
+    return "solve_batched matches per-series solve"
+
+
 SELFTESTS = [
     _selftest_windowing,
     _selftest_ridge_closed_form,
     _selftest_local_norm_solve,
+    _selftest_pooled_3d_solve,
+    _selftest_fused_val_mse,
+    _selftest_solve_batched_per_series,
 ]
 
 
