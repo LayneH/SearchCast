@@ -413,6 +413,101 @@ def _selftest_mixed_precision():
             f"chosen-alpha quality gap {quality_gap:.1e}")
 
 
+def _selftest_gram_prefix_extension():
+    """accumulate_gram over [0,n) must equal [0,k) then [k,n) — including for
+    seeded noise, whose block-deterministic draws make prefixes consistent."""
+    import torch
+    from optuna_ridge import RidgeSolver, LocalNormScaler, StandardStrategy
+
+    torch.manual_seed(6)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    S, N, L, H = 2, 700, 10, 3
+    X = torch.randn(S, N, L)
+    Y = torch.randn(S, N, H)
+    solver = RidgeSolver(device)
+
+    for aug in (None,
+                {"noise_type": "time", "sigma": 0.1},
+                {"noise_type": "freq", "sigma": 0.05}):
+        scaler = LocalNormScaler(StandardStrategy(), L, L)
+        full = torch.zeros(L + 1, L + 1, device=device, dtype=torch.float64)
+        solver.accumulate_gram(X, Y, scaler, aug, 0, N, XTX=full,
+                               seed_ctx=("t",), block=256)
+
+        split = torch.zeros_like(full)
+        k = 341  # deliberately not block-aligned
+        solver.accumulate_gram(X, Y, scaler, aug, 0, k, XTX=split,
+                               seed_ctx=("t",), block=256)
+        solver.accumulate_gram(X, Y, scaler, aug, k, N, XTX=split,
+                               seed_ctx=("t",), block=256)
+        rel = (full - split).abs().max().item() / full.abs().max().item()
+        assert rel < 1e-10, f"aug={aug}: prefix extension rel err {rel}"
+    return "prefix-extended Gram == one-shot Gram (clean, time & freq noise)"
+
+
+def _selftest_gram_solve_equivalence():
+    """solve_from_gram(accumulate_gram(...)) must match solve() on clean data."""
+    import torch
+    from optuna_ridge import RidgeSolver, LocalNormScaler, StandardStrategy
+
+    torch.manual_seed(7)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    S, N, L, H = 3, 400, 8, 4
+    X = torch.randn(S, N, L)
+    Y = torch.randn(S, N, H)
+    alphas = torch.logspace(-3, 3, 7, device=device)
+    solver = RidgeSolver(device)
+
+    for scaler_factory, fit_intercept in (
+            (lambda: None, True),
+            (lambda: LocalNormScaler(StandardStrategy(), L, 4), False)):
+        ref = solver.solve(X, Y, alphas, scaler=scaler_factory(), chunk_size=128)
+        F = L + 1
+        XTX = torch.zeros(F, F, device=device, dtype=torch.float64)
+        XTY = torch.zeros(F, H, device=device, dtype=torch.float64)
+        solver.accumulate_gram(X, Y, scaler_factory(), None, 0, N,
+                               XTX=XTX, XTY=XTY, block=128)
+        theta = solver.solve_from_gram(XTX, XTY, alphas, fit_intercept=fit_intercept)
+        err = (theta - ref).abs().max().item()
+        assert err < 1e-10, f"fit_intercept={fit_intercept}: {err}"
+    return "solve_from_gram(accumulate_gram) == solve() (both scaler paths)"
+
+
+def _selftest_gram_cache():
+    """GramCache must serve exact hits, extend partial hits, evict under
+    budget, and stay bit-consistent with uncached builds."""
+    import torch
+    from optuna_ridge import GramCache
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(8)
+    rows = torch.randn(1000, 6, dtype=torch.float64, device=device)
+
+    def make():
+        return torch.zeros(6, 6, dtype=torch.float64, device=device)
+
+    def extend(acc, lo, hi):
+        acc.add_(rows[lo:hi].T @ rows[lo:hi])
+
+    cache = GramCache(max_bytes=1 << 20, enabled=True, min_gap=100, verify_frac=1.0)
+    a = cache.get_or_build(("k1",), 500, make, extend)
+    b = cache.get_or_build(("k1",), 500, make, extend)   # exact hit (+ verify)
+    assert a is b and cache.hits == 1
+    c = cache.get_or_build(("k1",), 900, make, extend)   # partial: extend 500->900
+    assert cache.partial_hits == 1
+    ref = make(); extend(ref, 0, 900)
+    assert (c - ref).abs().max().item() < 1e-12
+    d = cache.get_or_build(("k1",), 550, make, extend)   # within min_gap: served, not stored
+    ref2 = make(); extend(ref2, 0, 550)
+    assert (d - ref2).abs().max().item() < 1e-12
+    assert set(cache._entries[("k1",)]) == {500, 900}
+
+    disabled = GramCache(enabled=False)
+    e = disabled.get_or_build(("k1",), 500, make, extend)
+    assert (e - a).abs().max().item() == 0.0 and not disabled._entries
+    return "GramCache hit/extend/gap/disabled semantics verified"
+
+
 SELFTESTS = [
     _selftest_windowing,
     _selftest_ridge_closed_form,
@@ -421,6 +516,9 @@ SELFTESTS = [
     _selftest_fused_val_mse,
     _selftest_solve_batched_per_series,
     _selftest_mixed_precision,
+    _selftest_gram_prefix_extension,
+    _selftest_gram_solve_equivalence,
+    _selftest_gram_cache,
 ]
 
 

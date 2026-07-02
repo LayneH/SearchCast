@@ -7,10 +7,12 @@ models against a global baseline. See README.md for usage and CLI arguments.
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import math
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import torch
@@ -67,6 +69,118 @@ class StageProfiler:
 
 
 PROFILER = StageProfiler()
+
+# Run-wide knobs configured once in main(). aug_base_seed makes augmentation
+# noise a deterministic function of (config, series, row) — reproducible under
+# --seed and consistent across cache prefix extensions.
+RUN_CONFIG = {"aug_base_seed": 0}
+
+
+def _stable_seed(key):
+    """Deterministic 63-bit seed from an arbitrary (repr-able) key.
+
+    Python's hash() is salted per process, so it cannot seed reproducible RNGs.
+    """
+    digest = hashlib.blake2b(repr(key).encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "little") >> 1
+
+
+class GramCache:
+    """Byte-budgeted LRU cache of prefix-Gram checkpoints.
+
+    Window row i of a series depends only on (series, lookback, transform,
+    noise) — not on the fold or horizon-group cutoff — and expanding-window
+    folds / horizon groups only vary the number of leading rows used. So a
+    Gram matrix is cached as checkpoints at row cutoffs and any request is
+    served by extending the nearest checkpoint below with a delta matmul over
+    only the new rows (never subtracting).
+
+    Checkpoints are only stored when at least `min_gap` rows from an existing
+    one, so an entry holds ~n_folds checkpoints instead of one per
+    (fold x horizon-group) cutoff; requests between checkpoints pay a small
+    delta extension instead of storage.
+    """
+
+    def __init__(self, max_bytes=4 << 30, enabled=True, min_gap=1024, verify_frac=0.0):
+        self.max_bytes = max_bytes
+        self.enabled = enabled
+        self.min_gap = min_gap
+        self.verify_frac = verify_frac
+        self._entries = OrderedDict()  # key -> {n_rows: tensor}
+        self._bytes = 0
+        self.hits = 0
+        self.partial_hits = 0
+        self.misses = 0
+        self._verify_countdown = int(1 / verify_frac) if verify_frac > 0 else 0
+
+    def get_or_build(self, key, n_rows, make_empty, extend):
+        """Return the accumulator for exactly the first n_rows window rows.
+
+        make_empty() -> zeroed accumulator tensor
+        extend(acc, lo, hi) -> accumulate rows [lo, hi) into acc in place
+
+        The returned tensor may be a live cache entry — callers must not
+        mutate it.
+        """
+        if not self.enabled:
+            acc = make_empty()
+            extend(acc, 0, n_rows)
+            return acc
+
+        cps = self._entries.get(key)
+        base_n = max((n for n in cps if n <= n_rows), default=None) if cps else None
+
+        if base_n == n_rows:
+            self.hits += 1
+            self._entries.move_to_end(key)
+            acc = cps[base_n]
+            if self.verify_frac > 0:
+                # deterministic 1-in-N sampling; avoids touching global RNG state
+                self._verify_countdown -= 1
+                if self._verify_countdown <= 0:
+                    self._verify_countdown = int(1 / self.verify_frac)
+                    ref = make_empty()
+                    extend(ref, 0, n_rows)
+                    err = (acc - ref).abs().max().item()
+                    scale = max(ref.abs().max().item(), 1e-30)
+                    assert err / scale < 1e-9, \
+                        f"GramCache self-check failed for {key}: rel err {err / scale:.3e}"
+            return acc
+
+        if base_n is None:
+            self.misses += 1
+            acc = make_empty()
+            lo = 0
+        else:
+            self.partial_hits += 1
+            self._entries.move_to_end(key)
+            acc = cps[base_n].clone()
+            lo = base_n
+        extend(acc, lo, n_rows)
+
+        if cps is None or all(abs(n_rows - n) >= self.min_gap for n in cps):
+            self._store(key, n_rows, acc)
+        return acc
+
+    def _store(self, key, n_rows, tensor):
+        entry_bytes = tensor.numel() * tensor.element_size()
+        if entry_bytes > self.max_bytes:
+            return
+        cps = self._entries.setdefault(key, {})
+        cps[n_rows] = tensor
+        self._bytes += entry_bytes
+        self._entries.move_to_end(key)
+        while self._bytes > self.max_bytes and len(self._entries) > 1:
+            old_key, old_cps = self._entries.popitem(last=False)
+            self._bytes -= sum(t.numel() * t.element_size() for t in old_cps.values())
+
+    def stats(self):
+        return {"hits": self.hits, "partial_hits": self.partial_hits,
+                "misses": self.misses, "bytes": self._bytes,
+                "entries": len(self._entries)}
+
+
+GRAM_CACHE = GramCache()
 
 # ==========================================
 # 1. Scaling Strategies & Scalers
@@ -223,13 +337,25 @@ class LocalNormScaler:
 
 
 class Augmentor:
-    def apply(self, X): return X
+    def apply(self, X, generator=None): return X
+
+    @staticmethod
+    def _randn(shape, like, generator):
+        """Gaussian draws matching `like`'s device/dtype, optionally seeded.
+
+        torch.randn_like does not accept a generator, so seeded draws go
+        through torch.randn explicitly.
+        """
+        if generator is None:
+            return torch.randn(shape, device=like.device, dtype=like.dtype)
+        return torch.randn(shape, device=like.device, dtype=like.dtype,
+                           generator=generator)
 
 class TimeDomainNoise(Augmentor):
     def __init__(self, sigma): self.sigma = sigma
-    def apply(self, X):
+    def apply(self, X, generator=None):
         if self.sigma <= 0: return X
-        return X.add_(torch.randn_like(X), alpha=self.sigma)
+        return X.add_(self._randn(X.shape, X, generator), alpha=self.sigma)
 
 class FreqDomainNoise(Augmentor):
     def __init__(self, sigma, mode='amplitude'):
@@ -239,27 +365,25 @@ class FreqDomainNoise(Augmentor):
         self.sigma = sigma
         self.mode = mode
 
-    def apply(self, X):
+    def apply(self, X, generator=None):
         # X shape: (Batch, Time, Feat) or (Batch, Time)
         # 1. FFT
         # rfft computes the real-input FFT (faster, gives only positive freqs)
-        X_freq = torch.fft.rfft(X, dim=1) 
-        
+        X_freq = torch.fft.rfft(X, dim=1)
+
         # 2. Perturb
         if self.mode == 'amplitude':
             # Perturb magnitude: Multiply by random scale ~ N(1, sigma)
-            # Create noise for (Batch, Freq_Bins, Feat)
-            noise = torch.randn_like(X_freq.abs()) * self.sigma
+            noise = self._randn(X_freq.shape, X, generator) * self.sigma
             # Apply to amplitude, keep phase
             # New_Complex = (Old_Abs + Noise) * e^(i * Old_Phase)
-            # Efficient way: scale real and imaginary parts uniformly? 
-            # Better: Scale magnitude directly
+            # Scale magnitude directly
             scale = 1.0 + noise
             X_freq = X_freq * scale
-            
+
         elif self.mode == 'phase':
             # Perturb phase: Add random angle ~ N(0, sigma)
-            phase_noise = torch.randn_like(X_freq.angle()) * self.sigma
+            phase_noise = self._randn(X_freq.shape, X, generator) * self.sigma
             # New_Complex = Old_Complex * e^(i * phase_noise)
             # Euler's formula: e^(ix) = cos(x) + i*sin(x)
             rotation = torch.polar(torch.ones_like(X_freq.abs()), phase_noise)
@@ -270,13 +394,18 @@ class FreqDomainNoise(Augmentor):
         return X_aug
 
 
-def apply_augmentation(X, config=None):
+def has_augmentation(config):
+    return (config is not None and config.get('noise_type') in ('time', 'freq')
+            and config.get('sigma', 0.0) > 0)
+
+
+def apply_augmentation(X, config=None, generator=None):
     if config is None: return X
     X_aug = X.clone()
     if config['noise_type'] == 'time':
-        X_aug = TimeDomainNoise(config['sigma']).apply(X_aug)
+        X_aug = TimeDomainNoise(config['sigma']).apply(X_aug, generator)
     elif config['noise_type'] == 'freq':
-        X_aug = FreqDomainNoise(config['sigma']).apply(X_aug)
+        X_aug = FreqDomainNoise(config['sigma']).apply(X_aug, generator)
     return X_aug
 
 # ==========================================
@@ -327,6 +456,124 @@ class RidgeSolver:
                     end = min(start + chunk_size, X.shape[1])
                     yield X[s, start:end], (Y[s, start:end] if Y is not None else None)
 
+    def _aug_generator(self, aug_config):
+        """Deterministic per-configuration noise generator for the non-cached
+        solve paths (refit, global baseline, per-series batched)."""
+        if not has_augmentation(aug_config):
+            return None
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(_stable_seed((
+            "aug", RUN_CONFIG["aug_base_seed"],
+            aug_config["noise_type"], round(float(aug_config["sigma"]), 9))))
+        return gen
+
+    def _transform_train_chunk(self, X_chunk, Y_chunk, scaler, aug_config, cdt,
+                               generator=None, noise_slice=None):
+        """Scaler transform + augmentation + intercept/scale feature for one
+        raw training chunk, exactly as the Gram accumulation consumes it.
+
+        noise_slice: pre-generated noise rows (from the block-deterministic
+        path) applied instead of drawing from `generator`.
+        """
+        use_local_norm = isinstance(scaler, LocalNormScaler)
+        if use_local_norm:
+            scaler.fit(X_chunk)
+            X_chunk = scaler.transform(X_chunk)
+            Y_chunk = scaler.transform_target(Y_chunk)
+            X_feat = X_chunk[:, :-1]
+            if noise_slice is not None:
+                X_feat = self._apply_block_noise(X_feat, aug_config, noise_slice)
+            else:
+                X_feat = apply_augmentation(X_feat, aug_config, generator)
+            X_chunk = torch.cat([X_feat, X_chunk[:, -1:]], dim=-1)
+        else:
+            if scaler is not None:
+                X_chunk = scaler.transform(X_chunk)
+                Y_chunk = scaler.transform(Y_chunk)
+            if noise_slice is not None:
+                X_chunk = self._apply_block_noise(X_chunk, aug_config, noise_slice)
+            else:
+                X_chunk = apply_augmentation(X_chunk, aug_config, generator)
+            ones = torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device)
+            X_chunk = torch.cat([ones, X_chunk], dim=1)
+        return X_chunk, Y_chunk
+
+    @staticmethod
+    def _apply_block_noise(X_feat, aug_config, noise):
+        """Apply pre-drawn noise rows (same math as the Augmentor classes)."""
+        sigma = aug_config["sigma"]
+        if aug_config["noise_type"] == "time":
+            return X_feat + sigma * noise
+        # freq (amplitude mode): scale rfft magnitudes by N(1, sigma)
+        X_freq = torch.fft.rfft(X_feat, dim=1)
+        X_freq = X_freq * (1.0 + sigma * noise)
+        return torch.fft.irfft(X_freq, n=X_feat.shape[1], dim=1)
+
+    @torch.no_grad()
+    def accumulate_gram(self, X_wins, Y_wins, scaler, aug_config, lo, hi,
+                        XTX=None, XTY=None, seed_ctx=None, block=8192):
+        """Accumulate Gram contributions of window rows [lo, hi) of each series
+        into XTX (F, F) and/or XTY (F, H), in place.
+
+        Chunks are aligned to fixed `block`-row boundaries in absolute row
+        index, and augmentation noise is drawn per (seed_ctx, series, block)
+        with full-block draws sliced to the covered rows — so the noise seen
+        by row i is identical no matter which prefix range builds it. That is
+        what makes cached prefix Grams extendable for noisy configurations,
+        and makes XTY passes consistent with the cached XTX.
+        """
+        if X_wins.dim() == 2:
+            X_wins = X_wins.unsqueeze(0)
+            Y_wins = Y_wins.unsqueeze(0)
+        S = X_wins.shape[0]
+        cdt = self.compute_dtype
+        adt = (XTX if XTX is not None else XTY).dtype
+        noisy = has_augmentation(aug_config)
+        use_local_norm = isinstance(scaler, LocalNormScaler)
+
+        with PROFILER.stage("gram"):
+            for s in range(S):
+                for b in range(lo // block * block, hi, block):
+                    r0, r1 = max(lo, b), min(hi, b + block)
+                    if r0 >= r1:
+                        continue
+                    X_chunk = X_wins[s, r0:r1].to(dtype=cdt, device=self.device,
+                                                  non_blocking=True)
+                    Y_chunk = Y_wins[s, r0:r1].to(dtype=cdt, device=self.device,
+                                                  non_blocking=True)
+
+                    noise_slice = None
+                    if noisy:
+                        # feature count the noise applies to (excludes the
+                        # appended scale feature / prepended intercept)
+                        Lf = X_chunk.shape[1]
+                        n_cols = (Lf // 2 + 1 if aug_config["noise_type"] == "freq"
+                                  else Lf)
+                        gen = torch.Generator(device=self.device)
+                        gen.manual_seed(_stable_seed(
+                            (seed_ctx, RUN_CONFIG["aug_base_seed"], s, b)))
+                        block_noise = torch.randn((block, n_cols), device=self.device,
+                                                  dtype=cdt, generator=gen)
+                        noise_slice = block_noise[r0 - b:r1 - b]
+
+                    X_chunk, Y_chunk = self._transform_train_chunk(
+                        X_chunk, Y_chunk, scaler, aug_config, cdt,
+                        noise_slice=noise_slice)
+
+                    if XTX is not None:
+                        gram = X_chunk.T @ X_chunk
+                        XTX.add_(gram if gram.dtype == adt else gram.to(adt))
+                    if XTY is not None:
+                        cross = X_chunk.T @ Y_chunk
+                        XTY.add_(cross if cross.dtype == adt else cross.to(adt))
+
+    @torch.no_grad()
+    def solve_from_gram(self, XTX, XTY, alphas, fit_intercept):
+        """Solve the regularized systems for every alpha from precomputed
+        Gram matrices (see accumulate_gram / GramCache)."""
+        with PROFILER.stage("solve"):
+            return self._solve_alpha_chunked(XTX, XTY, alphas, fit_intercept)
+
     @torch.no_grad()
     def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=None):
         """
@@ -364,30 +611,15 @@ class RidgeSolver:
         cdt, adt = self._dtypes(dtype)
         XTX = torch.zeros(F, F, device=self.device, dtype=adt)
         XTY = torch.zeros(F, H, device=self.device, dtype=adt)
+        aug_gen = self._aug_generator(aug_config)
 
         with PROFILER.stage("gram"):
             for X_chunk, Y_chunk in self._iter_row_chunks(X_train, Y_train, chunk_size):
                 X_chunk = X_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
                 Y_chunk = Y_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
 
-                if use_local_norm:
-                    # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
-                    scaler.fit(X_chunk)
-                    X_chunk = scaler.transform(X_chunk)
-                    Y_chunk = scaler.transform_target(Y_chunk)
-                    # Data augmentation (on normalized features, excluding appended scale)
-                    X_chunk_features = X_chunk[:, :-1]
-                    X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                    X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
-                else:
-                    # GlobalScaler or None: transform if scaler provided
-                    if scaler is not None:
-                        X_chunk = scaler.transform(X_chunk)
-                        Y_chunk = scaler.transform(Y_chunk)
-                    # Data augmentation
-                    X_chunk = apply_augmentation(X_chunk, aug_config)
-                    # Add intercept term
-                    X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device), X_chunk], dim=1)
+                X_chunk, Y_chunk = self._transform_train_chunk(
+                    X_chunk, Y_chunk, scaler, aug_config, cdt, generator=aug_gen)
 
                 # Accumulate the gram matrix (per-chunk matmul in the compute
                 # dtype, accumulation in the higher-precision dtype)
@@ -649,25 +881,15 @@ class RidgeSolver:
                 for si, s in enumerate(range(s_start, s_end)):
                     X_s = X_train_batch[s]  # (N_s, L)
                     Y_s = Y_train_batch[s]  # (N_s, H)
+                    aug_gen = self._aug_generator(aug_config)
 
                     for start in range(0, N_s, chunk_size):
                         end = min(start + chunk_size, N_s)
                         X_chunk = X_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
                         Y_chunk = Y_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
 
-                        if use_local_norm:
-                            scaler.fit(X_chunk)
-                            X_chunk = scaler.transform(X_chunk)
-                            Y_chunk = scaler.transform_target(Y_chunk)
-                            X_chunk_features = X_chunk[:, :-1]
-                            X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                            X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
-                        else:
-                            if scaler is not None:
-                                X_chunk = scaler.transform(X_chunk)
-                                Y_chunk = scaler.transform(Y_chunk)
-                            X_chunk = apply_augmentation(X_chunk, aug_config)
-                            X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device), X_chunk], dim=1)
+                        X_chunk, Y_chunk = self._transform_train_chunk(
+                            X_chunk, Y_chunk, scaler, aug_config, cdt, generator=aug_gen)
 
                         if cdt == adt:
                             XTX[si].add_(X_chunk.T @ X_chunk)
@@ -913,6 +1135,17 @@ class SingleObjectiveWrapper:
         # Keep the (small) series data resident on the compute device so all
         # windowing/unfold operations below are device-side views.
         self.data = self.data.to(device).contiguous()
+
+        # Identity of this wrapper's data slice for GramCache keys, plus a
+        # memo of already-evaluated hyperparameter combinations (duplicate
+        # Optuna trials are common in categorical-heavy spaces).
+        if series_idx is None:
+            self._series_key = ("all",)
+        elif isinstance(series_idx, (list, tuple)):
+            self._series_key = tuple(series_idx)
+        else:
+            self._series_key = (series_idx,)
+        self._memo = {}
         # Store lookback bounds for log-scale search
         self.min_lookback = min(lookbacks)
         self.max_lookback = max(lookbacks)
@@ -978,7 +1211,9 @@ class SingleObjectiveWrapper:
             return None
 
         if self.is_batched and not self.pool_series:
-            # Batched mode: keep series separate (S, N_s, L), one model per series
+            # Batched mode: keep series separate (S, N_s, L), one model per
+            # series. Per-series (S, F, F) Gram stacks are too large to cache,
+            # so this path stays uncached.
             Theta = self.solver.solve_batched(
                 X_train_w, Y_train, self.alphas,
                 scaler=scalers['train'],
@@ -989,18 +1224,74 @@ class SingleObjectiveWrapper:
             mse_per_alpha = self.solver.val_mse_batched(
                 X_val_w, Y_val, Theta, scaler=scalers['val'])  # (K,)
         else:
-            # Single-series / pooled mode: windows consumed in series-major
-            # order without materializing a flattened copy
-            Theta = self.solver.solve(
-                X_train_w, Y_train, self.alphas,
-                scaler=scalers['train'],
-                aug_config=aug_config
-            )
-
-            mse_per_alpha = self.solver.val_mse(
-                X_val_w, Y_val, Theta, scaler=scalers['val'])  # (K,)
+            # Single-series / pooled mode: one model over the pooled window
+            # rows — served from prefix-Gram checkpoints when cached
+            mse_per_alpha = self._eval_fold_from_gram(
+                X_train_w, Y_train, X_val_w, Y_val, scalers,
+                scaler_config, aug_config, lookback, train_end)
 
         return mse_per_alpha
+
+    def _eval_fold_from_gram(self, X_train_w, Y_train, X_val_w, Y_val, scalers,
+                             scaler_config, aug_config, lookback, train_end):
+        """Pooled/single-series fold evaluation through the GramCache.
+
+        XTX depends only on (series, lookback, transform, noise) and the row
+        cutoff — folds and horizon groups are nested prefixes of the same
+        window sequence — so it is cached across trials, folds, and
+        horizon-group studies. XTY additionally depends on the horizon tuple
+        (a few columns) and gets its own entries.
+        """
+        if X_train_w.dim() == 2:
+            X_train_w = X_train_w.unsqueeze(0)
+            Y_train = Y_train.unsqueeze(0)
+        n_rows = X_train_w.shape[1]
+        H = Y_train.shape[-1]
+        F = lookback + 1  # + scale feature (local) or intercept (global)
+        scaler_train = scalers['train']
+        use_local_norm = isinstance(scaler_train, LocalNormScaler)
+
+        if use_local_norm:
+            # per-window transform: prefix-safe across folds
+            xform_key = ("local", scaler_config["method"], scaler_train.last_k)
+        else:
+            # global scaler stats are fit on [:train_end] — fold-dependent,
+            # so entries are only shared within a fold (still across the
+            # horizon-group studies and duplicate trials)
+            xform_key = ("global", scaler_config["method"], train_end)
+        if has_augmentation(aug_config):
+            aug_key = (aug_config["noise_type"], round(float(aug_config["sigma"]), 9))
+        else:
+            aug_key = ("clean",)
+        base_key = (self._series_key, self.pool_series, lookback, xform_key, aug_key)
+        adt = self.solver.accum_dtype
+
+        def make_xtx():
+            return torch.zeros(F, F, device=self.device, dtype=adt)
+
+        def extend_xtx(acc, lo, hi):
+            self.solver.accumulate_gram(X_train_w, Y_train, scaler_train,
+                                        aug_config, lo, hi, XTX=acc,
+                                        seed_ctx=base_key)
+
+        def make_xty():
+            return torch.zeros(F, H, device=self.device, dtype=adt)
+
+        def extend_xty(acc, lo, hi):
+            self.solver.accumulate_gram(X_train_w, Y_train, scaler_train,
+                                        aug_config, lo, hi, XTY=acc,
+                                        seed_ctx=base_key)
+
+        horizon_t = (tuple(self.horizon) if isinstance(self.horizon, (list, tuple))
+                     else (self.horizon,))
+        XTX = GRAM_CACHE.get_or_build(("xtx",) + base_key, n_rows,
+                                      make_xtx, extend_xtx)
+        XTY = GRAM_CACHE.get_or_build(("xty",) + base_key + (horizon_t,), n_rows,
+                                      make_xty, extend_xty)
+
+        Theta = self.solver.solve_from_gram(XTX, XTY, self.alphas,
+                                            fit_intercept=not use_local_norm)
+        return self.solver.val_mse(X_val_w, Y_val, Theta, scaler=scalers['val'])
 
     def __call__(self, trial):
         # Suggest lookback using log-scale search (more efficient for context length)
@@ -1048,28 +1339,43 @@ class SingleObjectiveWrapper:
                 sigma = trial.suggest_float("aug_sigma", 1e-3, 0.5, log=True)
         aug_config = {"noise_type": noise_type, "sigma": sigma}
 
+        # Exact-duplicate trials (common with categorical-heavy spaces and
+        # shared startup trials) are answered from a memo without recompute.
+        memo_key = (lookback, scaler_config["scope"], scaler_config["method"],
+                    round(scaler_config["local_ratio"], 12),
+                    aug_config["noise_type"], round(aug_config["sigma"], 12))
+
         if self.n_folds == 1:
             # Single split evaluation
-            mse_per_alpha = self._evaluate_fold(
-                self.split_idx_1, self.split_idx_2, scaler_config, aug_config, lookback)
+            if memo_key in self._memo:
+                mse_per_alpha = self._memo[memo_key]
+            else:
+                mse_per_alpha = self._evaluate_fold(
+                    self.split_idx_1, self.split_idx_2, scaler_config, aug_config, lookback)
+                self._memo[memo_key] = mse_per_alpha
             if mse_per_alpha is None:
                 raise optuna.TrialPruned()
         else:
             # Expanding window k-fold CV
-            fold_mses = []
-            for fold_idx in range(self.n_folds):
-                train_end = self.fold_boundaries[fold_idx]
-                val_end = self.fold_boundaries[fold_idx + 1]
-                mse = self._evaluate_fold(
-                    train_end, val_end, scaler_config, aug_config, lookback)
-                if mse is not None:
-                    fold_mses.append(mse)
+            if memo_key in self._memo:
+                fold_mses_tensor = self._memo[memo_key]
+            else:
+                fold_mses = []
+                for fold_idx in range(self.n_folds):
+                    train_end = self.fold_boundaries[fold_idx]
+                    val_end = self.fold_boundaries[fold_idx + 1]
+                    mse = self._evaluate_fold(
+                        train_end, val_end, scaler_config, aug_config, lookback)
+                    if mse is not None:
+                        fold_mses.append(mse)
+                # Stack fold MSEs: (n_folds, K)
+                fold_mses_tensor = torch.stack(fold_mses) if fold_mses else None
+                self._memo[memo_key] = fold_mses_tensor
 
-            if not fold_mses:
+            if fold_mses_tensor is None:
                 raise optuna.TrialPruned()
 
-            # Stack fold MSEs: (n_folds, K)
-            fold_mses_tensor = torch.stack(fold_mses)
+            fold_mses = fold_mses_tensor  # (n_valid_folds, K)
             mean_mse = fold_mses_tensor.mean(dim=0)  # (K,)
 
             # Apply fold variance regularization if lambda > 0
@@ -1533,6 +1839,13 @@ def main():
                                  "or fp32. The global baseline always runs fp64.")
         parser.add_argument("--tf32", action="store_true", default=False,
                             help="Allow TF32 tensor-core matmuls (only affects fp32 compute)")
+        parser.add_argument("--cache_gb", type=float, default=4.0,
+                            help="GramCache budget in GiB (prefix-Gram checkpoints shared "
+                                 "across trials, folds, and horizon-group studies)")
+        parser.add_argument("--no_cache", action="store_true", default=False,
+                            help="Disable the GramCache (Grams are rebuilt every evaluation)")
+        parser.add_argument("--cache_verify", type=float, default=0.0,
+                            help="Fraction of cache hits to re-verify from scratch (debug)")
 
         # Debug/benchmark controls (scripts/bench_parity.py)
         parser.add_argument("--horizon_subset", type=str, default=None,
@@ -1556,6 +1869,11 @@ def main():
         if args.tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+        RUN_CONFIG["aug_base_seed"] = args.seed if args.seed is not None else 0
+        GRAM_CACHE.max_bytes = int(args.cache_gb * (1 << 30))
+        GRAM_CACHE.enabled = not args.no_cache
+        GRAM_CACHE.verify_frac = args.cache_verify
 
         PROFILER.enabled = args.profile
         horizon_subset = (set(int(i) for i in args.horizon_subset.split(","))
@@ -1623,10 +1941,11 @@ def main():
 
         if args.profile:
             profile = PROFILER.report()
+            profile["gram_cache"] = GRAM_CACHE.stats()
             with open(os.path.join(args.output_dir, "profile.json"), "w") as f:
                 json.dump(profile, f, indent=2)
             for name, rec in profile.items():
-                print(f"  [profile] {name}: {rec['total_s']:.2f}s over {rec['count']} calls")
+                print(f"  [profile] {name}: {rec}")
 
         if horizon_subset is not None:
             # Debug/benchmark mode: the remaining stages need every horizon group.
