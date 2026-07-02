@@ -6,9 +6,12 @@ models against a global baseline. See README.md for usage and CLI arguments.
 """
 
 import argparse
+import csv
+import json
 import os
 import math
 import time
+from contextlib import contextmanager
 
 import torch
 import pandas as pd
@@ -27,6 +30,43 @@ os.environ["MKL_NUM_THREADS"] = "1"
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+class StageProfiler:
+    """Coarse wall-time profiler for pipeline stages (prep/gram/solve/predict).
+
+    Disabled by default; when enabled it brackets each stage with
+    torch.cuda.synchronize() so GPU work is attributed to the right stage.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.totals = {}
+        self.counts = {}
+
+    @contextmanager
+    def stage(self, name):
+        if not self.enabled:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            self.totals[name] = self.totals.get(name, 0.0) + dt
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+    def report(self):
+        return {name: {"total_s": self.totals[name], "count": self.counts[name]}
+                for name in sorted(self.totals)}
+
+
+PROFILER = StageProfiler()
 
 # ==========================================
 # 1. Scaling Strategies & Scalers
@@ -282,33 +322,34 @@ class RidgeSolver:
         XTX = torch.zeros(F, F, device=self.device, dtype=dtype)
         XTY = torch.zeros(F, H, device=self.device, dtype=dtype)
 
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            X_chunk = X_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-            Y_chunk = Y_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+        with PROFILER.stage("gram"):
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                X_chunk = X_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                Y_chunk = Y_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
 
-            if use_local_norm:
-                # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
-                scaler.fit(X_chunk)
-                X_chunk = scaler.transform(X_chunk)
-                Y_chunk = scaler.transform_target(Y_chunk)
-                # Data augmentation (on normalized features, excluding appended scale)
-                X_chunk_features = X_chunk[:, :-1]
-                X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
-            else:
-                # GlobalScaler or None: transform if scaler provided
-                if scaler is not None:
+                if use_local_norm:
+                    # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
+                    scaler.fit(X_chunk)
                     X_chunk = scaler.transform(X_chunk)
-                    Y_chunk = scaler.transform(Y_chunk)
-                # Data augmentation
-                X_chunk = apply_augmentation(X_chunk, aug_config)
-                # Add intercept term
-                X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                    Y_chunk = scaler.transform_target(Y_chunk)
+                    # Data augmentation (on normalized features, excluding appended scale)
+                    X_chunk_features = X_chunk[:, :-1]
+                    X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
+                    X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
+                else:
+                    # GlobalScaler or None: transform if scaler provided
+                    if scaler is not None:
+                        X_chunk = scaler.transform(X_chunk)
+                        Y_chunk = scaler.transform(Y_chunk)
+                    # Data augmentation
+                    X_chunk = apply_augmentation(X_chunk, aug_config)
+                    # Add intercept term
+                    X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
 
-            # Accumulate the gram matrix
-            XTX.add_(X_chunk.T @ X_chunk)
-            XTY.add_(X_chunk.T @ Y_chunk)
+                # Accumulate the gram matrix
+                XTX.add_(X_chunk.T @ X_chunk)
+                XTY.add_(X_chunk.T @ Y_chunk)
 
         XTX_expanded = XTX.unsqueeze(0).expand(K, -1, -1)
 
@@ -326,15 +367,16 @@ class RidgeSolver:
         B = XTY.unsqueeze(0).expand(K, -1, -1)
 
         # Solve Linear System
-        try:
-            Lchol = torch.linalg.cholesky(A)
-            Theta = torch.cholesky_solve(B, Lchol)  # (K, F, H)
-        except RuntimeError:
+        with PROFILER.stage("solve"):
             try:
-                Theta = torch.linalg.solve(A, B)
+                Lchol = torch.linalg.cholesky(A)
+                Theta = torch.cholesky_solve(B, Lchol)  # (K, F, H)
             except RuntimeError:
-                XTX_inv = torch.linalg.pinv(A)
-                Theta = torch.einsum('kij,kjh->kih', XTX_inv, B)
+                try:
+                    Theta = torch.linalg.solve(A, B)
+                except RuntimeError:
+                    XTX_inv = torch.linalg.pinv(A)
+                    Theta = torch.einsum('kij,kjh->kih', XTX_inv, B)
 
         torch.cuda.empty_cache()
         return Theta
@@ -364,28 +406,29 @@ class RidgeSolver:
         use_local_norm = isinstance(scaler, LocalNormScaler)
 
         # Process in chunks for memory efficiency
-        Y_pred_chunks = []
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            X_chunk = X[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+        with PROFILER.stage("predict"):
+            Y_pred_chunks = []
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                X_chunk = X[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
 
-            if use_local_norm:
-                # LocalNormScaler: fit, transform, predict, then inv_transform
-                scaler.fit(X_chunk)
-                X_transformed = scaler.transform(X_chunk)
-                Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta)
-                Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
-            else:
-                # GlobalScaler or None: add intercept and predict
-                if scaler is not None:
-                    X_chunk = scaler.transform(X_chunk)
-                ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
-                X_chunk = torch.cat([ones, X_chunk], dim=1)
-                Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta)
+                if use_local_norm:
+                    # LocalNormScaler: fit, transform, predict, then inv_transform
+                    scaler.fit(X_chunk)
+                    X_transformed = scaler.transform(X_chunk)
+                    Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta)
+                    Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
+                else:
+                    # GlobalScaler or None: add intercept and predict
+                    if scaler is not None:
+                        X_chunk = scaler.transform(X_chunk)
+                    ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+                    X_chunk = torch.cat([ones, X_chunk], dim=1)
+                    Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta)
 
-            Y_pred_chunks.append(Y_pred_chunk.cpu())
+                Y_pred_chunks.append(Y_pred_chunk.cpu())
 
-        Y_pred = torch.cat(Y_pred_chunks, dim=1).to(self.device)
+            Y_pred = torch.cat(Y_pred_chunks, dim=1).to(self.device)
         return Y_pred
 
     @torch.no_grad()
@@ -441,31 +484,32 @@ class RidgeSolver:
             XTX = torch.zeros(Sb, F, F, device=self.device, dtype=dtype)
             XTY = torch.zeros(Sb, F, H, device=self.device, dtype=dtype)
 
-            for si, s in enumerate(range(s_start, s_end)):
-                X_s = X_train_batch[s]  # (N_s, L)
-                Y_s = Y_train_batch[s]  # (N_s, H)
+            with PROFILER.stage("gram"):
+                for si, s in enumerate(range(s_start, s_end)):
+                    X_s = X_train_batch[s]  # (N_s, L)
+                    Y_s = Y_train_batch[s]  # (N_s, H)
 
-                for start in range(0, N_s, chunk_size):
-                    end = min(start + chunk_size, N_s)
-                    X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                    Y_chunk = Y_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                    for start in range(0, N_s, chunk_size):
+                        end = min(start + chunk_size, N_s)
+                        X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                        Y_chunk = Y_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
 
-                    if use_local_norm:
-                        scaler.fit(X_chunk)
-                        X_chunk = scaler.transform(X_chunk)
-                        Y_chunk = scaler.transform_target(Y_chunk)
-                        X_chunk_features = X_chunk[:, :-1]
-                        X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                        X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
-                    else:
-                        if scaler is not None:
+                        if use_local_norm:
+                            scaler.fit(X_chunk)
                             X_chunk = scaler.transform(X_chunk)
-                            Y_chunk = scaler.transform(Y_chunk)
-                        X_chunk = apply_augmentation(X_chunk, aug_config)
-                        X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                            Y_chunk = scaler.transform_target(Y_chunk)
+                            X_chunk_features = X_chunk[:, :-1]
+                            X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
+                            X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
+                        else:
+                            if scaler is not None:
+                                X_chunk = scaler.transform(X_chunk)
+                                Y_chunk = scaler.transform(Y_chunk)
+                            X_chunk = apply_augmentation(X_chunk, aug_config)
+                            X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
 
-                    XTX[si].add_(X_chunk.T @ X_chunk)
-                    XTY[si].add_(X_chunk.T @ Y_chunk)
+                        XTX[si].add_(X_chunk.T @ X_chunk)
+                        XTY[si].add_(X_chunk.T @ Y_chunk)
 
             # --- Phase 2: Solve for all alphas, adaptively batched ---
             # Re-query free memory after Gram allocation
@@ -476,30 +520,31 @@ class RidgeSolver:
             solve_bytes_per_alpha = Sb * F * F * 8 * 3
             alpha_batch = max(1, min(K, solve_budget // max(1, solve_bytes_per_alpha)))
 
-            for k_start in range(0, K, alpha_batch):
-                k_end = min(k_start + alpha_batch, K)
-                Kb = k_end - k_start
-                alpha_chunk = alphas[k_start:k_end]
+            with PROFILER.stage("solve"):
+                for k_start in range(0, K, alpha_batch):
+                    k_end = min(k_start + alpha_batch, K)
+                    Kb = k_end - k_start
+                    alpha_chunk = alphas[k_start:k_end]
 
-                diag_vals = alpha_chunk.view(Kb, 1, 1).expand(Kb, Sb, F).clone()
-                if fit_intercept:
-                    diag_vals[:, :, 0] = 0.0
-                I_reg = torch.diag_embed(diag_vals)
+                    diag_vals = alpha_chunk.view(Kb, 1, 1).expand(Kb, Sb, F).clone()
+                    if fit_intercept:
+                        diag_vals[:, :, 0] = 0.0
+                    I_reg = torch.diag_embed(diag_vals)
 
-                A = XTX.unsqueeze(0).expand(Kb, -1, -1, -1) + I_reg  # (Kb, Sb, F, F)
-                B = XTY.unsqueeze(0).expand(Kb, -1, -1, -1).clone()  # (Kb, Sb, F, H)
+                    A = XTX.unsqueeze(0).expand(Kb, -1, -1, -1) + I_reg  # (Kb, Sb, F, F)
+                    B = XTY.unsqueeze(0).expand(Kb, -1, -1, -1).clone()  # (Kb, Sb, F, H)
 
-                try:
-                    L = torch.linalg.cholesky(A)
-                    Theta[k_start:k_end, s_start:s_end] = torch.cholesky_solve(B, L).cpu()
-                except RuntimeError:
                     try:
-                        Theta[k_start:k_end, s_start:s_end] = torch.linalg.solve(A, B).cpu()
+                        L = torch.linalg.cholesky(A)
+                        Theta[k_start:k_end, s_start:s_end] = torch.cholesky_solve(B, L).cpu()
                     except RuntimeError:
-                        A_inv = torch.linalg.pinv(A)
-                        Theta[k_start:k_end, s_start:s_end] = torch.einsum('ksij,ksjh->ksih', A_inv, B).cpu()
+                        try:
+                            Theta[k_start:k_end, s_start:s_end] = torch.linalg.solve(A, B).cpu()
+                        except RuntimeError:
+                            A_inv = torch.linalg.pinv(A)
+                            Theta[k_start:k_end, s_start:s_end] = torch.einsum('ksij,ksjh->ksih', A_inv, B).cpu()
 
-                del A, B, I_reg, diag_vals
+                    del A, B, I_reg, diag_vals
 
             del XTX, XTY
             torch.cuda.empty_cache()
@@ -530,36 +575,37 @@ class RidgeSolver:
         Y_pred_all = []
 
         # Process each series
-        for s in range(S):
-            X_s = X_batch[s]  # (N_s, L)
-            theta_s = theta[:, s, :, :].to(dtype=dtype, device=self.device, non_blocking=True)  # (K, F, H)
+        with PROFILER.stage("predict"):
+            for s in range(S):
+                X_s = X_batch[s]  # (N_s, L)
+                theta_s = theta[:, s, :, :].to(dtype=dtype, device=self.device, non_blocking=True)  # (K, F, H)
 
-            # Process in chunks for memory efficiency
-            Y_pred_chunks = []
-            for start in range(0, N_s, chunk_size):
-                end = min(start + chunk_size, N_s)
-                X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                # Process in chunks for memory efficiency
+                Y_pred_chunks = []
+                for start in range(0, N_s, chunk_size):
+                    end = min(start + chunk_size, N_s)
+                    X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
 
-                if use_local_norm:
-                    # LocalNormScaler: fit, transform, predict, then inv_transform
-                    scaler.fit(X_chunk)
-                    X_transformed = scaler.transform(X_chunk)
-                    Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta_s)
-                    Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
-                else:
-                    # GlobalScaler or None: add intercept and predict
-                    if scaler is not None:
-                        X_chunk = scaler.transform(X_chunk)
-                    ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
-                    X_chunk = torch.cat([ones, X_chunk], dim=1)
-                    Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta_s)
+                    if use_local_norm:
+                        # LocalNormScaler: fit, transform, predict, then inv_transform
+                        scaler.fit(X_chunk)
+                        X_transformed = scaler.transform(X_chunk)
+                        Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta_s)
+                        Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
+                    else:
+                        # GlobalScaler or None: add intercept and predict
+                        if scaler is not None:
+                            X_chunk = scaler.transform(X_chunk)
+                        ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+                        X_chunk = torch.cat([ones, X_chunk], dim=1)
+                        Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta_s)
 
-                Y_pred_chunks.append(Y_pred_chunk.cpu())
+                    Y_pred_chunks.append(Y_pred_chunk.cpu())
 
-            Y_pred_s = torch.cat(Y_pred_chunks, dim=1)  # (K, N_s, H)
-            Y_pred_all.append(Y_pred_s)
+                Y_pred_s = torch.cat(Y_pred_chunks, dim=1)  # (K, N_s, H)
+                Y_pred_all.append(Y_pred_s)
 
-        Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H) — stays on CPU
+            Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H) — stays on CPU
         return Y_pred
 
 # ==========================================
@@ -777,9 +823,10 @@ class SingleObjectiveWrapper:
             mse_per_alpha: (K,) tensor of MSE for each alpha, or None if fold is invalid
         """
         try:
-            X_train_w, Y_train, X_val_w, Y_val, _, _, scalers = \
-                get_prepared_data(self.data, lookback, self.horizon,
-                                  train_end, val_end, scaler_config)
+            with PROFILER.stage("prep"):
+                X_train_w, Y_train, X_val_w, Y_val, _, _, scalers = \
+                    get_prepared_data(self.data, lookback, self.horizon,
+                                      train_end, val_end, scaler_config)
         except ValueError:
             return None
 
@@ -924,6 +971,7 @@ class SingleObjectiveWrapper:
         best_val_mse, best_idx = torch.min(mse_per_alpha, dim=0)
 
         trial.set_user_attr("best_alpha", self.alphas[best_idx].item())
+        trial.set_user_attr("mse_per_alpha", mse_per_alpha.tolist())
         return best_val_mse.item()
 
     def refit_test(self, best_params, best_alpha_val, use_train_val=False):
@@ -1091,16 +1139,50 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
 # ==========================================
 # 6. Main Loop
 # ==========================================
+class TrialLogWriter:
+    """Appends one CSV row per finished Optuna trial (used by scripts/bench_parity.py)."""
+
+    FIELDS = ["study", "trial", "state", "value", "duration_s", "best_alpha",
+              "params", "mse_per_alpha"]
+
+    def __init__(self, path):
+        self.path = path
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(self.path, "w", newline="") as f:
+            csv.writer(f).writerow(self.FIELDS)
+
+    def callback(self, study_key):
+        def _cb(study, trial):
+            row = [
+                study_key,
+                trial.number,
+                trial.state.name,
+                "" if trial.value is None else repr(trial.value),
+                "" if trial.duration is None else f"{trial.duration.total_seconds():.4f}",
+                repr(trial.user_attrs["best_alpha"]) if "best_alpha" in trial.user_attrs else "",
+                json.dumps(trial.params, sort_keys=True),
+                json.dumps(trial.user_attrs.get("mse_per_alpha", [])),
+            ]
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+        return _cb
+
+
 def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trials, device,
                         horizon_group_size=1, series_group_size=1,
                         search_train_ratio=0.4, search_test_ratio=0.2,
                         split_starts=None, split_ends=None, n_folds=1, fold_reg_lambda=0.0,
                         scaler_scope="search", scaler_method="search",
                         fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                        pool_series=False, seed=None):
+                        pool_series=False, seed=None,
+                        horizon_group_subset=None, trial_log=None):
     best_results = []
     raw_results = {}  # Storage for alignment
     T, S = data.shape
+
+    trial_log_writer = TrialLogWriter(trial_log) if trial_log else None
 
     # Handle special value: -1 means all series
     if series_group_size <= 0:
@@ -1122,7 +1204,9 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                          else f"[{series_names_in_group[0]}..{series_names_in_group[-1]}]")
         print(f"\n[Series Group: {group_display}]")
 
-        for h_idx in range(0, len(horizons), horizon_group_size):
+        for group_idx, h_idx in enumerate(range(0, len(horizons), horizon_group_size)):
+            if horizon_group_subset is not None and group_idx not in horizon_group_subset:
+                continue
             horizon_group = horizons[h_idx:h_idx + horizon_group_size]
 
             # HP Search: use series group (grouped objective for robust HP selection)
@@ -1140,8 +1224,10 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                 pool_series=pool_series)
 
             # Time the optimization
+            callbacks = ([trial_log_writer.callback(f"sg{sg_idx}_hg{group_idx}")]
+                         if trial_log_writer else None)
             search_start = time.time()
-            study.optimize(wrap, n_trials=n_trials)
+            study.optimize(wrap, n_trials=n_trials, callbacks=callbacks)
             search_elapsed = time.time() - search_start
             search_times.append(search_elapsed)
 
@@ -1317,6 +1403,15 @@ def main():
                             help="Fix lookback to a single value instead of searching")
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed for numpy/torch and Optuna TPE sampler (for multi-seed runs)")
+
+        # Debug/benchmark controls (scripts/bench_parity.py)
+        parser.add_argument("--horizon_subset", type=str, default=None,
+                            help="Comma-separated horizon-group indices to search (debug/benchmark; "
+                                 "skips the global baseline and alignment stages)")
+        parser.add_argument("--trial_log", type=str, default=None,
+                            help="Path to a CSV logging every finished Optuna trial")
+        parser.add_argument("--profile", action="store_true", default=False,
+                            help="Record coarse per-stage timings (adds CUDA syncs; benchmark only)")
         args = parser.parse_args()
 
         if args.seed is not None:
@@ -1327,6 +1422,10 @@ def main():
 
         os.makedirs(args.output_dir, exist_ok=True)
         DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        PROFILER.enabled = args.profile
+        horizon_subset = (set(int(i) for i in args.horizon_subset.split(","))
+                          if args.horizon_subset else None)
 
         # Config
         if args.fixed_lookback is not None:
@@ -1383,9 +1482,23 @@ def main():
             scaler_scope=args.scaler_scope, scaler_method=args.scaler_method,
             fixed_local_ratio=args.fixed_local_ratio, fixed_noise_type=args.fixed_noise_type,
             fixed_aug_sigma=args.fixed_aug_sigma,
-            pool_series=args.pool_series, seed=args.seed
+            pool_series=args.pool_series, seed=args.seed,
+            horizon_group_subset=horizon_subset, trial_log=args.trial_log
         )
         pd.DataFrame(best_df).to_csv(f"{args.output_dir}/local_results.csv", index=False)
+
+        if args.profile:
+            profile = PROFILER.report()
+            with open(os.path.join(args.output_dir, "profile.json"), "w") as f:
+                json.dump(profile, f, indent=2)
+            for name, rec in profile.items():
+                print(f"  [profile] {name}: {rec['total_s']:.2f}s over {rec['count']} calls")
+
+        if horizon_subset is not None:
+            # Debug/benchmark mode: the remaining stages need every horizon group.
+            print(f"--horizon_subset set; skipping global baseline and alignment stages.")
+            return
+
         local_raw = []
         for h_idx in range(0, len(HORIZONS), HORIZON_GROUP_SIZE):
             horizon_group = HORIZONS[h_idx:h_idx + HORIZON_GROUP_SIZE]
