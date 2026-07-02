@@ -282,9 +282,32 @@ def apply_augmentation(X, config=None):
 # ==========================================
 # 2. Solver
 # ==========================================
+# compute dtype (chunk transforms + big matmuls), accumulate/solve dtype
+PRECISION_CONFIGS = {
+    "fp64": (torch.float64, torch.float64),
+    "mixed": (torch.float32, torch.float64),
+    "fp32": (torch.float32, torch.float32),
+}
+
+
 class RidgeSolver:
-    def __init__(self, device):
+    def __init__(self, device, precision="fp64"):
+        """
+        Args:
+            device: torch device
+            precision: 'fp64' (exact, default), 'mixed' (fp32 Gram matmuls
+                accumulated and solved in fp64 — the big-FLOPs win on GPUs
+                with slow fp64), or 'fp32' (everything fp32)
+        """
         self.device = device
+        self.precision = precision
+        self.compute_dtype, self.accum_dtype = PRECISION_CONFIGS[precision]
+
+    def _dtypes(self, dtype):
+        """Resolve (compute, accumulate) dtypes; an explicit dtype overrides both."""
+        if dtype is None:
+            return self.compute_dtype, self.accum_dtype
+        return dtype, dtype
 
     @staticmethod
     def _iter_row_chunks(X, Y, chunk_size):
@@ -305,7 +328,7 @@ class RidgeSolver:
                     yield X[s, start:end], (Y[s, start:end] if Y is not None else None)
 
     @torch.no_grad()
-    def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
+    def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=None):
         """
         Solve ridge regression for multiple alpha values.
 
@@ -338,13 +361,14 @@ class RidgeSolver:
             F = L + 1  # features + intercept
             fit_intercept = True
 
-        XTX = torch.zeros(F, F, device=self.device, dtype=dtype)
-        XTY = torch.zeros(F, H, device=self.device, dtype=dtype)
+        cdt, adt = self._dtypes(dtype)
+        XTX = torch.zeros(F, F, device=self.device, dtype=adt)
+        XTY = torch.zeros(F, H, device=self.device, dtype=adt)
 
         with PROFILER.stage("gram"):
             for X_chunk, Y_chunk in self._iter_row_chunks(X_train, Y_train, chunk_size):
-                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
-                Y_chunk = Y_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
+                X_chunk = X_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
 
                 if use_local_norm:
                     # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
@@ -363,11 +387,16 @@ class RidgeSolver:
                     # Data augmentation
                     X_chunk = apply_augmentation(X_chunk, aug_config)
                     # Add intercept term
-                    X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                    X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device), X_chunk], dim=1)
 
-                # Accumulate the gram matrix
-                XTX.add_(X_chunk.T @ X_chunk)
-                XTY.add_(X_chunk.T @ Y_chunk)
+                # Accumulate the gram matrix (per-chunk matmul in the compute
+                # dtype, accumulation in the higher-precision dtype)
+                if cdt == adt:
+                    XTX.add_(X_chunk.T @ X_chunk)
+                    XTY.add_(X_chunk.T @ Y_chunk)
+                else:
+                    XTX.add_((X_chunk.T @ X_chunk).to(adt))
+                    XTY.add_((X_chunk.T @ Y_chunk).to(adt))
 
         with PROFILER.stage("solve"):
             Theta = self._solve_alpha_chunked(XTX, XTY, alphas, fit_intercept)
@@ -424,7 +453,7 @@ class RidgeSolver:
         return Theta
 
     @torch.no_grad()
-    def predict(self, X, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def predict(self, X, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Make predictions using trained weights.
 
@@ -443,6 +472,7 @@ class RidgeSolver:
             Y_pred: (K, N_total, H) predictions on the solver device
         """
         K, _, H = theta.shape
+        dtype, _ = self._dtypes(dtype)
         theta = theta.to(dtype=dtype, device=self.device, non_blocking=True)
 
         use_local_norm = isinstance(scaler, LocalNormScaler)
@@ -493,7 +523,7 @@ class RidgeSolver:
         return pred
 
     @torch.no_grad()
-    def val_mse(self, X, Y, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def val_mse(self, X, Y, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Fused validation MSE per alpha: prediction and squared error in one
         chunked pass, never materializing the (K, N, H) prediction tensor and
@@ -511,21 +541,22 @@ class RidgeSolver:
         """
         K = theta.shape[0]
         H = Y.shape[-1]
-        theta = theta.to(dtype=dtype, device=self.device, non_blocking=True)
+        cdt, adt = self._dtypes(dtype)
+        theta = theta.to(dtype=cdt, device=self.device, non_blocking=True)
 
-        sse = torch.zeros(K, device=self.device, dtype=dtype)
+        sse = torch.zeros(K, device=self.device, dtype=adt)
         n_rows = 0
         with PROFILER.stage("predict"):
             for X_chunk, Y_chunk in self._iter_row_chunks(X, Y, chunk_size):
-                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
-                Y_chunk = Y_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
-                pred = self._predict_chunk(X_chunk, theta, scaler, dtype)
-                sse += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1))
+                X_chunk = X_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                pred = self._predict_chunk(X_chunk, theta, scaler, cdt)
+                sse += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1), dtype=adt)
                 n_rows += X_chunk.shape[0]
         return (sse / (n_rows * H)).cpu()
 
     @torch.no_grad()
-    def val_mse_batched(self, X_batch, Y_batch, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def val_mse_batched(self, X_batch, Y_batch, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Fused validation MSE for per-series models: per-series MSE averaged
         across series, per alpha.
@@ -544,22 +575,23 @@ class RidgeSolver:
         S, N_s, _ = X_batch.shape
         K = theta.shape[0]
         H = Y_batch.shape[-1]
+        cdt, adt = self._dtypes(dtype)
 
-        sse = torch.zeros(K, S, device=self.device, dtype=dtype)
+        sse = torch.zeros(K, S, device=self.device, dtype=adt)
         with PROFILER.stage("predict"):
             for s in range(S):
-                theta_s = theta[:, s].to(dtype=dtype, device=self.device, non_blocking=True)
+                theta_s = theta[:, s].to(dtype=cdt, device=self.device, non_blocking=True)
                 for start in range(0, N_s, chunk_size):
                     end = min(start + chunk_size, N_s)
-                    X_chunk = X_batch[s, start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                    Y_chunk = Y_batch[s, start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                    pred = self._predict_chunk(X_chunk, theta_s, scaler, dtype)
-                    sse[:, s] += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1))
+                    X_chunk = X_batch[s, start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                    Y_chunk = Y_batch[s, start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                    pred = self._predict_chunk(X_chunk, theta_s, scaler, cdt)
+                    sse[:, s] += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1), dtype=adt)
         mse_per_series = sse / (N_s * H)  # (K, S)
         return mse_per_series.mean(dim=1).cpu()
 
     @torch.no_grad()
-    def solve_batched(self, X_train_batch, Y_train_batch, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
+    def solve_batched(self, X_train_batch, Y_train_batch, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=None):
         """
         Solve ridge regression for multiple series simultaneously (batched).
 
@@ -591,7 +623,8 @@ class RidgeSolver:
             F = L + 1  # features + intercept
             fit_intercept = True
 
-        Theta = torch.zeros(K, S, F, H, device=self.device, dtype=dtype)
+        cdt, adt = self._dtypes(dtype)
+        Theta = torch.zeros(K, S, F, H, device=self.device, dtype=adt)
 
         # Determine series_batch: must fit Gram matrices + at least 1 alpha solve
         # Gram: Sb * (F*F + F*H) * 8 bytes for XTX + XTY
@@ -609,8 +642,8 @@ class RidgeSolver:
             Sb = s_end - s_start
 
             # --- Phase 1: Accumulate Gram matrices for this series batch ---
-            XTX = torch.zeros(Sb, F, F, device=self.device, dtype=dtype)
-            XTY = torch.zeros(Sb, F, H, device=self.device, dtype=dtype)
+            XTX = torch.zeros(Sb, F, F, device=self.device, dtype=adt)
+            XTY = torch.zeros(Sb, F, H, device=self.device, dtype=adt)
 
             with PROFILER.stage("gram"):
                 for si, s in enumerate(range(s_start, s_end)):
@@ -619,8 +652,8 @@ class RidgeSolver:
 
                     for start in range(0, N_s, chunk_size):
                         end = min(start + chunk_size, N_s)
-                        X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                        Y_chunk = Y_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                        X_chunk = X_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                        Y_chunk = Y_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
 
                         if use_local_norm:
                             scaler.fit(X_chunk)
@@ -634,10 +667,14 @@ class RidgeSolver:
                                 X_chunk = scaler.transform(X_chunk)
                                 Y_chunk = scaler.transform(Y_chunk)
                             X_chunk = apply_augmentation(X_chunk, aug_config)
-                            X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                            X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device), X_chunk], dim=1)
 
-                        XTX[si].add_(X_chunk.T @ X_chunk)
-                        XTY[si].add_(X_chunk.T @ Y_chunk)
+                        if cdt == adt:
+                            XTX[si].add_(X_chunk.T @ X_chunk)
+                            XTY[si].add_(X_chunk.T @ Y_chunk)
+                        else:
+                            XTX[si].add_((X_chunk.T @ X_chunk).to(adt))
+                            XTY[si].add_((X_chunk.T @ Y_chunk).to(adt))
 
             # --- Phase 2: Solve for all alphas, chunked over alphas ---
             with PROFILER.stage("solve"):
@@ -649,7 +686,7 @@ class RidgeSolver:
         return Theta
 
     @torch.no_grad()
-    def predict_batched(self, X_batch, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def predict_batched(self, X_batch, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Make predictions using batched trained weights (one model per series).
 
@@ -665,6 +702,7 @@ class RidgeSolver:
         """
         S, N_s, L = X_batch.shape
         K, _, _, H = theta.shape
+        dtype, _ = self._dtypes(dtype)
 
         use_local_norm = isinstance(scaler, LocalNormScaler)
 
@@ -838,7 +876,7 @@ class SingleObjectiveWrapper:
                  n_folds=1, fold_reg_lambda=0.0,
                  scaler_scope="search", scaler_method="search",
                  fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                 pool_series=False):
+                 pool_series=False, precision="fp64"):
         """
         Args:
             data: (T, S) time series data
@@ -881,7 +919,7 @@ class SingleObjectiveWrapper:
         self.horizon = horizon
         self.alphas = alphas
         self.device = device
-        self.solver = RidgeSolver(device)
+        self.solver = RidgeSolver(device, precision=precision)
         self.n_folds = n_folds
         self.fold_reg_lambda = fold_reg_lambda
         self.pool_series = pool_series
@@ -1254,7 +1292,7 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                         split_starts=None, split_ends=None, n_folds=1, fold_reg_lambda=0.0,
                         scaler_scope="search", scaler_method="search",
                         fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                        pool_series=False, seed=None,
+                        pool_series=False, seed=None, precision="fp64",
                         horizon_group_subset=None, trial_log=None):
     best_results = []
     raw_results = {}  # Storage for alignment
@@ -1299,7 +1337,7 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                 scaler_scope=scaler_scope, scaler_method=scaler_method,
                 fixed_local_ratio=fixed_local_ratio, fixed_noise_type=fixed_noise_type,
                 fixed_aug_sigma=fixed_aug_sigma,
-                pool_series=pool_series)
+                pool_series=pool_series, precision=precision)
 
             # Time the optimization
             callbacks = ([trial_log_writer.callback(f"sg{sg_idx}_hg{group_idx}")]
@@ -1348,7 +1386,7 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                         split_starts=split_starts, split_ends=split_ends,
                         scaler_scope=scaler_scope, scaler_method=scaler_method,
                         fixed_local_ratio=fixed_local_ratio, fixed_noise_type=fixed_noise_type,
-                        fixed_aug_sigma=fixed_aug_sigma)
+                        fixed_aug_sigma=fixed_aug_sigma, precision=precision)
                     metrics = refitter.refit_test(best['params'], best['best_alpha'])
 
                     # Save Raw Vectors
@@ -1487,6 +1525,15 @@ def main():
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed for numpy/torch and Optuna TPE sampler (for multi-seed runs)")
 
+        # Performance controls
+        parser.add_argument("--precision", type=str, default="fp64",
+                            choices=["fp64", "mixed", "fp32"],
+                            help="Solver precision for the local-model search: fp64 (exact, "
+                                 "default), mixed (fp32 Gram matmuls, fp64 accumulate/solve), "
+                                 "or fp32. The global baseline always runs fp64.")
+        parser.add_argument("--tf32", action="store_true", default=False,
+                            help="Allow TF32 tensor-core matmuls (only affects fp32 compute)")
+
         # Debug/benchmark controls (scripts/bench_parity.py)
         parser.add_argument("--horizon_subset", type=str, default=None,
                             help="Comma-separated horizon-group indices to search (debug/benchmark; "
@@ -1505,6 +1552,10 @@ def main():
 
         os.makedirs(args.output_dir, exist_ok=True)
         DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if args.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         PROFILER.enabled = args.profile
         horizon_subset = (set(int(i) for i in args.horizon_subset.split(","))
@@ -1565,7 +1616,7 @@ def main():
             scaler_scope=args.scaler_scope, scaler_method=args.scaler_method,
             fixed_local_ratio=args.fixed_local_ratio, fixed_noise_type=args.fixed_noise_type,
             fixed_aug_sigma=args.fixed_aug_sigma,
-            pool_series=args.pool_series, seed=args.seed,
+            pool_series=args.pool_series, seed=args.seed, precision=args.precision,
             horizon_group_subset=horizon_subset, trial_log=args.trial_log
         )
         pd.DataFrame(best_df).to_csv(f"{args.output_dir}/local_results.csv", index=False)

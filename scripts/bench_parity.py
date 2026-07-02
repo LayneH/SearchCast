@@ -55,6 +55,8 @@ def cmd_run(args):
         "--horizon_subset", args.horizon_subset,
         "--trial_log", os.path.join(out_dir, "trials.csv"),
     ]
+    if args.precision != "fp64":
+        cmd += ["--precision", args.precision]
     if args.noise == "none":
         cmd += ["--fixed_noise_type", "none"]
     if args.profile:
@@ -75,6 +77,7 @@ def cmd_run(args):
     meta = {
         "dataset": args.dataset,
         "n_trials": args.n_trials,
+        "precision": args.precision,
         "seed": args.seed,
         "horizon_subset": args.horizon_subset,
         "noise": args.noise,
@@ -140,10 +143,12 @@ def cmd_compare(args):
             max_msepa_rel = max(max_msepa_rel, _rel_diff(ma, mb))
 
     n = len(common)
+    n_matched = n - len(param_mismatches)
+    alpha_frac = (n_matched - len(alpha_mismatches)) / max(1, n_matched)
     print(f"Compared {n} trials:")
-    print(f"  identical params:        {n - len(param_mismatches)}/{n}")
-    print(f"  identical chosen alpha:  {n - len(param_mismatches) - len(alpha_mismatches)}"
-          f"/{n - len(param_mismatches)} (of param-matched)")
+    print(f"  identical params:        {n_matched}/{n}")
+    print(f"  identical chosen alpha:  {n_matched - len(alpha_mismatches)}"
+          f"/{n_matched} (of param-matched, {alpha_frac:.1%})")
     print(f"  max rel diff val MSE:    {max_val_rel:.3e}" +
           (f" at {max_val_rel_key}" if max_val_rel_key else ""))
     print(f"  max rel diff mse/alpha:  {max_msepa_rel:.3e}")
@@ -172,9 +177,14 @@ def cmd_compare(args):
             print(f"  {meta_dir}: wall={meta['wall_time_s']}s rev={meta['git_rev'][:8]}"
                   f"{'+dirty' if meta['git_dirty'] else ''}")
 
-    ok = (not param_mismatches and not alpha_mismatches
-          and max_val_rel <= args.tol and max_msepa_rel <= args.tol)
-    print("PARITY: " + ("PASS" if ok else f"FAIL (tol={args.tol:g})"))
+    msepa_tol = args.msepa_tol if args.msepa_tol is not None else args.tol
+    ok = (not param_mismatches
+          and alpha_frac >= args.alpha_match
+          and max_val_rel <= args.tol
+          and max_msepa_rel <= msepa_tol)
+    print("PARITY: " + ("PASS" if ok else
+                        f"FAIL (tol={args.tol:g}, msepa_tol={msepa_tol:g}, "
+                        f"alpha_match>={args.alpha_match:g})"))
     sys.exit(0 if ok else 1)
 
 
@@ -362,6 +372,47 @@ def _selftest_solve_batched_per_series():
     return "solve_batched matches per-series solve"
 
 
+def _selftest_mixed_precision():
+    """mixed precision (fp32 Gram matmuls, fp64 accumulate/solve) must track the
+    fp64 solution closely and pick the same alpha on a realistic problem."""
+    import torch
+    from optuna_ridge import RidgeSolver, LocalNormScaler, StandardStrategy
+
+    torch.manual_seed(5)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    N, L, H = 4000, 64, 8
+    # float32 inputs, like the real (standardized) datasets
+    t = torch.arange(N + L + H, dtype=torch.float32)
+    series = torch.sin(t / 17) + 0.1 * torch.randn_like(t)
+    wins = series.unfold(0, L + H, 1)[:N]
+    X, Y = wins[:, :L], wins[:, L:]
+    alphas = torch.logspace(-6, 4, 21, device=device)
+
+    n_tr = int(N * 0.7)
+    X_tr, Y_tr, X_va, Y_va = X[:n_tr], Y[:n_tr], X[n_tr:], Y[n_tr:]
+
+    s64 = RidgeSolver(device, precision="fp64")
+    smx = RidgeSolver(device, precision="mixed")
+    scaler64 = LocalNormScaler(StandardStrategy(), L, L)
+    scalermx = LocalNormScaler(StandardStrategy(), L, L)
+
+    t64 = s64.solve(X_tr, Y_tr, alphas, scaler=scaler64, chunk_size=1024)
+    tmx = smx.solve(X_tr, Y_tr, alphas, scaler=scalermx, chunk_size=1024)
+    m64 = s64.val_mse(X_va, Y_va, t64, scaler=scaler64, chunk_size=1024)
+    mmx = smx.val_mse(X_va, Y_va, tmx, scaler=scalermx, chunk_size=1024)
+
+    # Best achievable val MSE must match; the chosen alpha must be equally
+    # good under fp64 (argmin can hop between statistically indistinguishable
+    # neighbors on flat regions of the alpha curve — the run-level gate
+    # allows 5% of such hops)
+    rel = abs(m64.min().item() - mmx.min().item()) / m64.min().item()
+    assert rel < 1e-3, f"best val MSE rel diff {rel}"
+    quality_gap = (m64[mmx.argmin()].item() - m64.min().item()) / m64.min().item()
+    assert quality_gap < 1e-3, f"mixed-chosen alpha is worse under fp64 by {quality_gap}"
+    return (f"mixed tracks fp64: best-MSE rel diff {rel:.1e}, "
+            f"chosen-alpha quality gap {quality_gap:.1e}")
+
+
 SELFTESTS = [
     _selftest_windowing,
     _selftest_ridge_closed_form,
@@ -369,6 +420,7 @@ SELFTESTS = [
     _selftest_pooled_3d_solve,
     _selftest_fused_val_mse,
     _selftest_solve_batched_per_series,
+    _selftest_mixed_precision,
 ]
 
 
@@ -397,6 +449,7 @@ def main():
     p_run.add_argument("--n_trials", type=int, default=10)
     p_run.add_argument("--seed", type=int, default=0)
     p_run.add_argument("--horizon_subset", type=str, default="0,14,29")
+    p_run.add_argument("--precision", choices=["fp64", "mixed", "fp32"], default="fp64")
     p_run.add_argument("--noise", choices=["none", "search"], default="none",
                        help="'none' fixes augmentation off (required for strict parity)")
     p_run.add_argument("--profile", action="store_true")
@@ -409,6 +462,13 @@ def main():
     p_cmp.add_argument("dir_b")
     p_cmp.add_argument("--tol", type=float, default=1e-9,
                        help="max allowed relative diff in val MSE (default: strict fp64 parity)")
+    p_cmp.add_argument("--alpha_match", type=float, default=1.0,
+                       help="required fraction of param-matched trials with identical chosen "
+                            "alpha (use 0.95 for the mixed-precision gate)")
+    p_cmp.add_argument("--msepa_tol", type=float, default=None,
+                       help="max allowed relative diff in the full per-alpha MSE vector "
+                            "(default: same as --tol; extreme alphas are numerically "
+                            "sensitive, so the mixed gate typically relaxes this)")
     p_cmp.set_defaults(func=cmd_compare)
 
     p_st = sub.add_parser("selftest", help="run numerical unit checks")

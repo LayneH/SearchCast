@@ -93,6 +93,19 @@ python optuna_ridge.py \
 | `--fixed_noise_type` | `None` | Fix augmentation: `none`, `time`, `freq`, or `None` (search) |
 | `--fixed_aug_sigma` | `None` | Fix augmentation intensity (disables search) |
 
+### Performance Controls
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--precision` | `fp64` | Solver precision: `fp64` (exact), `mixed` (fp32 Gram matmuls, fp64 accumulate/solve — the big win on GPUs with slow fp64), `fp32` |
+| `--tf32` | `False` | Allow TF32 tensor-core matmuls (only affects fp32 compute) |
+
+`fp64` reproduces the paper numerics exactly. `mixed` computes the O(N·F²)
+Gram matmuls in fp32 and everything conditioning-sensitive (accumulation,
+Cholesky, weights) in fp64; validate it for your dataset with
+`scripts/bench_parity.py compare <fp64_run> <mixed_run> --tol 1e-3 --alpha_match 0.95 --msepa_tol 1`.
+The global baseline always runs fp64.
+
 ### Benchmark / Debug Controls
 
 | Argument | Default | Description |
