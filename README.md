@@ -102,6 +102,8 @@ python optuna_ridge.py \
 | `--cache_gb` | `4.0` | GramCache budget (GiB). XᵀX/XᵀY prefix checkpoints are shared across trials, expanding-window folds, and horizon-group studies |
 | `--no_cache` | `False` | Disable the GramCache (every evaluation rebuilds its Grams) |
 | `--cache_verify` | `0.0` | Recompute this fraction of cache hits from scratch and assert agreement (debug) |
+| `--lookback_grid` | `False` | Search lookback as an **ordered index** over the 19-value grid instead of a continuous log-int. Keeps TPE's ordinal modeling (unlike a categorical) while making the space finite for maximal cache/memo reuse; changes the search space |
+| `--no_shared_startup` | `False` | Disable the deterministic startup trials enqueued into every horizon-group study. Shared startups give each study identical grid-spanning first evaluations whose Gram work is computed once and reused across all studies |
 
 `fp64` reproduces the paper numerics exactly. `mixed` computes the O(N·F²)
 Gram matmuls in fp32 and everything conditioning-sensitive (accumulation,

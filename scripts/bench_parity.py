@@ -59,6 +59,10 @@ def cmd_run(args):
         cmd += ["--precision", args.precision]
     if args.noise == "none":
         cmd += ["--fixed_noise_type", "none"]
+    if args.no_shared_startup:
+        cmd += ["--no_shared_startup"]
+    if args.lookback_grid:
+        cmd += ["--lookback_grid"]
     if args.profile:
         cmd += ["--profile"]
     cmd += args.extra_args
@@ -78,6 +82,8 @@ def cmd_run(args):
         "dataset": args.dataset,
         "n_trials": args.n_trials,
         "precision": args.precision,
+        "no_shared_startup": args.no_shared_startup,
+        "lookback_grid": args.lookback_grid,
         "seed": args.seed,
         "horizon_subset": args.horizon_subset,
         "noise": args.noise,
@@ -548,6 +554,10 @@ def main():
     p_run.add_argument("--seed", type=int, default=0)
     p_run.add_argument("--horizon_subset", type=str, default="0,14,29")
     p_run.add_argument("--precision", choices=["fp64", "mixed", "fp32"], default="fp64")
+    p_run.add_argument("--no_shared_startup", action="store_true",
+                       help="disable shared startup trials (required for strict parity "
+                            "against runs made before they existed)")
+    p_run.add_argument("--lookback_grid", action="store_true")
     p_run.add_argument("--noise", choices=["none", "search"], default="none",
                        help="'none' fixes augmentation off (required for strict parity)")
     p_run.add_argument("--profile", action="store_true")

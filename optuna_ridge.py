@@ -1098,7 +1098,7 @@ class SingleObjectiveWrapper:
                  n_folds=1, fold_reg_lambda=0.0,
                  scaler_scope="search", scaler_method="search",
                  fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                 pool_series=False, precision="fp64"):
+                 pool_series=False, precision="fp64", lookback_grid=False):
         """
         Args:
             data: (T, S) time series data
@@ -1149,6 +1149,9 @@ class SingleObjectiveWrapper:
         # Store lookback bounds for log-scale search
         self.min_lookback = min(lookbacks)
         self.max_lookback = max(lookbacks)
+        # Sorted grid for the ordered-index space (--lookback_grid)
+        self.valid_lookbacks = sorted(int(lb) for lb in lookbacks)
+        self.lookback_grid = lookback_grid
         self.horizon = horizon
         self.alphas = alphas
         self.device = device
@@ -1299,8 +1302,15 @@ class SingleObjectiveWrapper:
         return self.solver.val_mse(X_val_w, Y_val, Theta, scaler=scalers['val'])
 
     def __call__(self, trial):
-        # Suggest lookback using log-scale search (more efficient for context length)
-        lookback = trial.suggest_int("lookback", self.min_lookback, self.max_lookback, log=True)
+        if self.lookback_grid:
+            # Ordered integer index over the sorted lookback grid: keeps TPE's
+            # ordinal modeling (unlike a categorical) while making the space
+            # finite, so the memo/GramCache converge most trials to ~free
+            lb_idx = trial.suggest_int("lookback_idx", 0, len(self.valid_lookbacks) - 1)
+            lookback = self.valid_lookbacks[lb_idx]
+        else:
+            # Suggest lookback using log-scale search (more efficient for context length)
+            lookback = trial.suggest_int("lookback", self.min_lookback, self.max_lookback, log=True)
 
         # Scaler scope (global vs local)
         if self.scaler_scope == "search":
@@ -1461,12 +1471,19 @@ class SingleObjectiveWrapper:
 
         single_alpha = torch.tensor([best_alpha_val], device=self.device)
 
-        # Solve with scaler
-        Theta = self.solver.solve(
-            X_train_w, Y_train, single_alpha,
-            scaler=scalers['test'],
-            aug_config=aug_config,
-        )
+        # Solve with scaler. The pooled/single path goes through the GramCache:
+        # refit training windows are a prefix of the same window sequence the
+        # search evaluated, so this extends existing checkpoints.
+        if self.is_batched and not self.pool_series:
+            Theta = self.solver.solve(
+                X_train_w, Y_train, single_alpha,
+                scaler=scalers['test'],
+                aug_config=aug_config,
+            )
+        else:
+            Theta = self._theta_from_gram(
+                X_train_w, Y_train, scalers['test'],
+                scaler_config, aug_config, lookback, start, single_alpha)
 
         # Predict with scaler
         Y_pred = self.solver.predict(X_test_w, Theta, scaler=scalers['test'])
@@ -1597,6 +1614,46 @@ class TrialLogWriter:
         return _cb
 
 
+def build_startup_trials(n_startup, valid_lookbacks, scaler_scope, scaler_method,
+                         fixed_local_ratio, fixed_noise_type, fixed_aug_sigma,
+                         lookback_grid):
+    """Deterministic grid-spanning startup configurations.
+
+    Enqueued into every horizon-group study of a series group: the first
+    evaluations of studies 2..N then hit GramCache entries built by study 1
+    (XTX is horizon-independent), and every study's TPE starts from identical,
+    informative coverage of the lookback grid — with or without --seed.
+    Noise is left off (searched configs) so the entries stay clean-keyed.
+    """
+    if n_startup <= 0:
+        return []
+    lbs = sorted(int(lb) for lb in valid_lookbacks)
+    idxs = sorted({round(i * (len(lbs) - 1) / max(1, n_startup - 1))
+                   for i in range(n_startup)})
+    local_ratios = [1.0, 0.1, 0.01]
+    trials = []
+    for j, li in enumerate(idxs):
+        params = {}
+        if lookback_grid:
+            params["lookback_idx"] = li
+        else:
+            params["lookback"] = lbs[li]
+        scope = scaler_scope if scaler_scope != "search" else \
+            ("local" if j % 2 == 0 else "global")
+        if scaler_scope == "search":
+            params["scaler_scope"] = scope
+        if scaler_method == "search":
+            params["scaler_method"] = "mean" if (j // 2) % 2 == 0 else "robust"
+        if scope == "local" and fixed_local_ratio is None:
+            params["local_ratio"] = local_ratios[j % len(local_ratios)]
+        if fixed_noise_type is None:
+            params["noise_type"] = "none"
+        elif fixed_noise_type != "none" and fixed_aug_sigma is None:
+            params["aug_sigma"] = 0.02
+        trials.append(params)
+    return trials
+
+
 def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trials, device,
                         horizon_group_size=1, series_group_size=1,
                         search_train_ratio=0.4, search_test_ratio=0.2,
@@ -1604,6 +1661,7 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                         scaler_scope="search", scaler_method="search",
                         fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
                         pool_series=False, seed=None, precision="fp64",
+                        lookback_grid=False, shared_startup=True,
                         horizon_group_subset=None, trial_log=None):
     best_results = []
     raw_results = {}  # Storage for alignment
@@ -1618,6 +1676,13 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
     # Valid lookback calculation
     valid_lookbacks = [int(lb) for lb in lookbacks if lb < int(T * 0.3) - max(horizons)]
     print(f"Valid Lookbacks: {valid_lookbacks}")
+    sorted_lookbacks = sorted(valid_lookbacks)
+
+    startup_trials = []
+    if shared_startup:
+        startup_trials = build_startup_trials(
+            min(10, n_trials // 2), valid_lookbacks, scaler_scope, scaler_method,
+            fixed_local_ratio, fixed_noise_type, fixed_aug_sigma, lookback_grid)
 
     # Timing statistics
     search_times = []
@@ -1648,7 +1713,13 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                 scaler_scope=scaler_scope, scaler_method=scaler_method,
                 fixed_local_ratio=fixed_local_ratio, fixed_noise_type=fixed_noise_type,
                 fixed_aug_sigma=fixed_aug_sigma,
-                pool_series=pool_series, precision=precision)
+                pool_series=pool_series, precision=precision,
+                lookback_grid=lookback_grid)
+
+            # Shared deterministic startup: identical first evaluations across
+            # all horizon-group studies -> GramCache hits from study 2 on
+            for startup_params in startup_trials:
+                study.enqueue_trial(startup_params)
 
             # Time the optimization
             callbacks = ([trial_log_writer.callback(f"sg{sg_idx}_hg{group_idx}")]
@@ -1659,7 +1730,10 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
             search_times.append(search_elapsed)
 
             # Extract best results from study
-            params = study.best_trial.params
+            params = dict(study.best_trial.params)
+            if "lookback_idx" in params:
+                # resolve the ordered-index space back to an actual lookback
+                params["lookback"] = sorted_lookbacks[params["lookback_idx"]]
             noise_type = params.get('noise_type', 'none')
             aug_sigma = params.get('aug_sigma', 0.0) if noise_type != 'none' else 0.0
             local_ratio = params.get('local_ratio', fixed_local_ratio if fixed_local_ratio else 1.0)
@@ -1851,6 +1925,13 @@ def main():
                             help="Disable the GramCache (Grams are rebuilt every evaluation)")
         parser.add_argument("--cache_verify", type=float, default=0.0,
                             help="Fraction of cache hits to re-verify from scratch (debug)")
+        parser.add_argument("--lookback_grid", action="store_true", default=False,
+                            help="Search lookback as an ordered index over the discrete grid "
+                                 "instead of a continuous log-int (finite space, max cache "
+                                 "reuse; changes the search space)")
+        parser.add_argument("--no_shared_startup", action="store_true", default=False,
+                            help="Disable the shared deterministic startup trials that are "
+                                 "enqueued into every horizon-group study")
 
         # Debug/benchmark controls (scripts/bench_parity.py)
         parser.add_argument("--horizon_subset", type=str, default=None,
@@ -1940,6 +2021,7 @@ def main():
             fixed_local_ratio=args.fixed_local_ratio, fixed_noise_type=args.fixed_noise_type,
             fixed_aug_sigma=args.fixed_aug_sigma,
             pool_series=args.pool_series, seed=args.seed, precision=args.precision,
+            lookback_grid=args.lookback_grid, shared_startup=not args.no_shared_startup,
             horizon_group_subset=horizon_subset, trial_log=args.trial_log
         )
         pd.DataFrame(best_df).to_csv(f"{args.output_dir}/local_results.csv", index=False)
