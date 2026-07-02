@@ -1232,15 +1232,15 @@ class SingleObjectiveWrapper:
 
         return mse_per_alpha
 
-    def _eval_fold_from_gram(self, X_train_w, Y_train, X_val_w, Y_val, scalers,
-                             scaler_config, aug_config, lookback, train_end):
-        """Pooled/single-series fold evaluation through the GramCache.
+    def _theta_from_gram(self, X_train_w, Y_train, scaler_train,
+                         scaler_config, aug_config, lookback, train_end, alphas):
+        """Pooled/single-series ridge weights through the GramCache.
 
         XTX depends only on (series, lookback, transform, noise) and the row
-        cutoff — folds and horizon groups are nested prefixes of the same
-        window sequence — so it is cached across trials, folds, and
-        horizon-group studies. XTY additionally depends on the horizon tuple
-        (a few columns) and gets its own entries.
+        cutoff — folds, horizon groups, and the refit split are nested
+        prefixes of the same window sequence — so it is cached across trials,
+        folds, horizon-group studies, and the refit stage. XTY additionally
+        depends on the horizon tuple (a few columns) and gets its own entries.
         """
         if X_train_w.dim() == 2:
             X_train_w = X_train_w.unsqueeze(0)
@@ -1248,7 +1248,6 @@ class SingleObjectiveWrapper:
         n_rows = X_train_w.shape[1]
         H = Y_train.shape[-1]
         F = lookback + 1  # + scale feature (local) or intercept (global)
-        scaler_train = scalers['train']
         use_local_norm = isinstance(scaler_train, LocalNormScaler)
 
         if use_local_norm:
@@ -1289,8 +1288,14 @@ class SingleObjectiveWrapper:
         XTY = GRAM_CACHE.get_or_build(("xty",) + base_key + (horizon_t,), n_rows,
                                       make_xty, extend_xty)
 
-        Theta = self.solver.solve_from_gram(XTX, XTY, self.alphas,
-                                            fit_intercept=not use_local_norm)
+        return self.solver.solve_from_gram(XTX, XTY, alphas,
+                                           fit_intercept=not use_local_norm)
+
+    def _eval_fold_from_gram(self, X_train_w, Y_train, X_val_w, Y_val, scalers,
+                             scaler_config, aug_config, lookback, train_end):
+        Theta = self._theta_from_gram(X_train_w, Y_train, scalers['train'],
+                                      scaler_config, aug_config, lookback,
+                                      train_end, self.alphas)
         return self.solver.val_mse(X_val_w, Y_val, Theta, scaler=scalers['val'])
 
     def __call__(self, trial):
