@@ -6,9 +6,14 @@ models against a global baseline. See README.md for usage and CLI arguments.
 """
 
 import argparse
+import csv
+import hashlib
+import json
 import os
 import math
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import torch
 import pandas as pd
@@ -27,6 +32,155 @@ os.environ["MKL_NUM_THREADS"] = "1"
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+class StageProfiler:
+    """Coarse wall-time profiler for pipeline stages (prep/gram/solve/predict).
+
+    Disabled by default; when enabled it brackets each stage with
+    torch.cuda.synchronize() so GPU work is attributed to the right stage.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.totals = {}
+        self.counts = {}
+
+    @contextmanager
+    def stage(self, name):
+        if not self.enabled:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            self.totals[name] = self.totals.get(name, 0.0) + dt
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+    def report(self):
+        return {name: {"total_s": self.totals[name], "count": self.counts[name]}
+                for name in sorted(self.totals)}
+
+
+PROFILER = StageProfiler()
+
+# Run-wide knobs configured once in main(). aug_base_seed makes augmentation
+# noise a deterministic function of (config, series, row) — reproducible under
+# --seed and consistent across cache prefix extensions.
+RUN_CONFIG = {"aug_base_seed": 0}
+
+
+def _stable_seed(key):
+    """Deterministic 63-bit seed from an arbitrary (repr-able) key.
+
+    Python's hash() is salted per process, so it cannot seed reproducible RNGs.
+    """
+    digest = hashlib.blake2b(repr(key).encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "little") >> 1
+
+
+class GramCache:
+    """Byte-budgeted LRU cache of prefix-Gram checkpoints.
+
+    Window row i of a series depends only on (series, lookback, transform,
+    noise) — not on the fold or horizon-group cutoff — and expanding-window
+    folds / horizon groups only vary the number of leading rows used. So a
+    Gram matrix is cached as checkpoints at row cutoffs and any request is
+    served by extending the nearest checkpoint below with a delta matmul over
+    only the new rows (never subtracting).
+
+    Checkpoints are only stored when at least `min_gap` rows from an existing
+    one, so an entry holds ~n_folds checkpoints instead of one per
+    (fold x horizon-group) cutoff; requests between checkpoints pay a small
+    delta extension instead of storage.
+    """
+
+    def __init__(self, max_bytes=4 << 30, enabled=True, min_gap=1024, verify_frac=0.0):
+        self.max_bytes = max_bytes
+        self.enabled = enabled
+        self.min_gap = min_gap
+        self.verify_frac = verify_frac
+        self._entries = OrderedDict()  # key -> {n_rows: tensor}
+        self._bytes = 0
+        self.hits = 0
+        self.partial_hits = 0
+        self.misses = 0
+        self._verify_countdown = int(1 / verify_frac) if verify_frac > 0 else 0
+
+    def get_or_build(self, key, n_rows, make_empty, extend):
+        """Return the accumulator for exactly the first n_rows window rows.
+
+        make_empty() -> zeroed accumulator tensor
+        extend(acc, lo, hi) -> accumulate rows [lo, hi) into acc in place
+
+        The returned tensor may be a live cache entry — callers must not
+        mutate it.
+        """
+        if not self.enabled:
+            acc = make_empty()
+            extend(acc, 0, n_rows)
+            return acc
+
+        cps = self._entries.get(key)
+        base_n = max((n for n in cps if n <= n_rows), default=None) if cps else None
+
+        if base_n == n_rows:
+            self.hits += 1
+            self._entries.move_to_end(key)
+            acc = cps[base_n]
+            if self.verify_frac > 0:
+                # deterministic 1-in-N sampling; avoids touching global RNG state
+                self._verify_countdown -= 1
+                if self._verify_countdown <= 0:
+                    self._verify_countdown = int(1 / self.verify_frac)
+                    ref = make_empty()
+                    extend(ref, 0, n_rows)
+                    err = (acc - ref).abs().max().item()
+                    scale = max(ref.abs().max().item(), 1e-30)
+                    assert err / scale < 1e-9, \
+                        f"GramCache self-check failed for {key}: rel err {err / scale:.3e}"
+            return acc
+
+        if base_n is None:
+            self.misses += 1
+            acc = make_empty()
+            lo = 0
+        else:
+            self.partial_hits += 1
+            self._entries.move_to_end(key)
+            acc = cps[base_n].clone()
+            lo = base_n
+        extend(acc, lo, n_rows)
+
+        if cps is None or all(abs(n_rows - n) >= self.min_gap for n in cps):
+            self._store(key, n_rows, acc)
+        return acc
+
+    def _store(self, key, n_rows, tensor):
+        entry_bytes = tensor.numel() * tensor.element_size()
+        if entry_bytes > self.max_bytes:
+            return
+        cps = self._entries.setdefault(key, {})
+        cps[n_rows] = tensor
+        self._bytes += entry_bytes
+        self._entries.move_to_end(key)
+        while self._bytes > self.max_bytes and len(self._entries) > 1:
+            old_key, old_cps = self._entries.popitem(last=False)
+            self._bytes -= sum(t.numel() * t.element_size() for t in old_cps.values())
+
+    def stats(self):
+        return {"hits": self.hits, "partial_hits": self.partial_hits,
+                "misses": self.misses, "bytes": self._bytes,
+                "entries": len(self._entries)}
+
+
+GRAM_CACHE = GramCache()
 
 # ==========================================
 # 1. Scaling Strategies & Scalers
@@ -183,13 +337,25 @@ class LocalNormScaler:
 
 
 class Augmentor:
-    def apply(self, X): return X
+    def apply(self, X, generator=None): return X
+
+    @staticmethod
+    def _randn(shape, like, generator):
+        """Gaussian draws matching `like`'s device/dtype, optionally seeded.
+
+        torch.randn_like does not accept a generator, so seeded draws go
+        through torch.randn explicitly.
+        """
+        if generator is None:
+            return torch.randn(shape, device=like.device, dtype=like.dtype)
+        return torch.randn(shape, device=like.device, dtype=like.dtype,
+                           generator=generator)
 
 class TimeDomainNoise(Augmentor):
     def __init__(self, sigma): self.sigma = sigma
-    def apply(self, X):
+    def apply(self, X, generator=None):
         if self.sigma <= 0: return X
-        return X.add_(torch.randn_like(X), alpha=self.sigma)
+        return X.add_(self._randn(X.shape, X, generator), alpha=self.sigma)
 
 class FreqDomainNoise(Augmentor):
     def __init__(self, sigma, mode='amplitude'):
@@ -199,27 +365,25 @@ class FreqDomainNoise(Augmentor):
         self.sigma = sigma
         self.mode = mode
 
-    def apply(self, X):
+    def apply(self, X, generator=None):
         # X shape: (Batch, Time, Feat) or (Batch, Time)
         # 1. FFT
         # rfft computes the real-input FFT (faster, gives only positive freqs)
-        X_freq = torch.fft.rfft(X, dim=1) 
-        
+        X_freq = torch.fft.rfft(X, dim=1)
+
         # 2. Perturb
         if self.mode == 'amplitude':
             # Perturb magnitude: Multiply by random scale ~ N(1, sigma)
-            # Create noise for (Batch, Freq_Bins, Feat)
-            noise = torch.randn_like(X_freq.abs()) * self.sigma
+            noise = self._randn(X_freq.shape, X, generator) * self.sigma
             # Apply to amplitude, keep phase
             # New_Complex = (Old_Abs + Noise) * e^(i * Old_Phase)
-            # Efficient way: scale real and imaginary parts uniformly? 
-            # Better: Scale magnitude directly
+            # Scale magnitude directly
             scale = 1.0 + noise
             X_freq = X_freq * scale
-            
+
         elif self.mode == 'phase':
             # Perturb phase: Add random angle ~ N(0, sigma)
-            phase_noise = torch.randn_like(X_freq.angle()) * self.sigma
+            phase_noise = self._randn(X_freq.shape, X, generator) * self.sigma
             # New_Complex = Old_Complex * e^(i * phase_noise)
             # Euler's formula: e^(ix) = cos(x) + i*sin(x)
             rotation = torch.polar(torch.ones_like(X_freq.abs()), phase_noise)
@@ -230,30 +394,195 @@ class FreqDomainNoise(Augmentor):
         return X_aug
 
 
-def apply_augmentation(X, config=None):
+def has_augmentation(config):
+    return (config is not None and config.get('noise_type') in ('time', 'freq')
+            and config.get('sigma', 0.0) > 0)
+
+
+def apply_augmentation(X, config=None, generator=None):
     if config is None: return X
     X_aug = X.clone()
     if config['noise_type'] == 'time':
-        X_aug = TimeDomainNoise(config['sigma']).apply(X_aug)
+        X_aug = TimeDomainNoise(config['sigma']).apply(X_aug, generator)
     elif config['noise_type'] == 'freq':
-        X_aug = FreqDomainNoise(config['sigma']).apply(X_aug)
+        X_aug = FreqDomainNoise(config['sigma']).apply(X_aug, generator)
     return X_aug
 
 # ==========================================
 # 2. Solver
 # ==========================================
+# compute dtype (chunk transforms + big matmuls), accumulate/solve dtype
+PRECISION_CONFIGS = {
+    "fp64": (torch.float64, torch.float64),
+    "mixed": (torch.float32, torch.float64),
+    "fp32": (torch.float32, torch.float32),
+}
+
+
 class RidgeSolver:
-    def __init__(self, device):
+    def __init__(self, device, precision="fp64"):
+        """
+        Args:
+            device: torch device
+            precision: 'fp64' (exact, default), 'mixed' (fp32 Gram matmuls
+                accumulated and solved in fp64 — the big-FLOPs win on GPUs
+                with slow fp64), or 'fp32' (everything fp32)
+        """
         self.device = device
+        self.precision = precision
+        self.compute_dtype, self.accum_dtype = PRECISION_CONFIGS[precision]
+
+    def _dtypes(self, dtype):
+        """Resolve (compute, accumulate) dtypes; an explicit dtype overrides both."""
+        if dtype is None:
+            return self.compute_dtype, self.accum_dtype
+        return dtype, dtype
+
+    @staticmethod
+    def _iter_row_chunks(X, Y, chunk_size):
+        """Yield 2D (rows, L) / (rows, H) chunks from 2D (N, ...) or 3D (S, N, ...) inputs.
+
+        3D inputs are consumed in series-major order, i.e. equivalent to
+        X.reshape(-1, L) without materializing the flattened copy (the windowed
+        views produced by unfold cannot be reshaped for free).
+        """
+        if X.dim() == 2:
+            for start in range(0, X.shape[0], chunk_size):
+                end = min(start + chunk_size, X.shape[0])
+                yield X[start:end], (Y[start:end] if Y is not None else None)
+        else:
+            for s in range(X.shape[0]):
+                for start in range(0, X.shape[1], chunk_size):
+                    end = min(start + chunk_size, X.shape[1])
+                    yield X[s, start:end], (Y[s, start:end] if Y is not None else None)
+
+    def _aug_generator(self, aug_config):
+        """Deterministic per-configuration noise generator for the non-cached
+        solve paths (refit, global baseline, per-series batched)."""
+        if not has_augmentation(aug_config):
+            return None
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(_stable_seed((
+            "aug", RUN_CONFIG["aug_base_seed"],
+            aug_config["noise_type"], round(float(aug_config["sigma"]), 9))))
+        return gen
+
+    def _transform_train_chunk(self, X_chunk, Y_chunk, scaler, aug_config, cdt,
+                               generator=None, noise_slice=None):
+        """Scaler transform + augmentation + intercept/scale feature for one
+        raw training chunk, exactly as the Gram accumulation consumes it.
+
+        noise_slice: pre-generated noise rows (from the block-deterministic
+        path) applied instead of drawing from `generator`.
+        """
+        use_local_norm = isinstance(scaler, LocalNormScaler)
+        if use_local_norm:
+            scaler.fit(X_chunk)
+            X_chunk = scaler.transform(X_chunk)
+            Y_chunk = scaler.transform_target(Y_chunk)
+            X_feat = X_chunk[:, :-1]
+            if noise_slice is not None:
+                X_feat = self._apply_block_noise(X_feat, aug_config, noise_slice)
+            else:
+                X_feat = apply_augmentation(X_feat, aug_config, generator)
+            X_chunk = torch.cat([X_feat, X_chunk[:, -1:]], dim=-1)
+        else:
+            if scaler is not None:
+                X_chunk = scaler.transform(X_chunk)
+                Y_chunk = scaler.transform(Y_chunk)
+            if noise_slice is not None:
+                X_chunk = self._apply_block_noise(X_chunk, aug_config, noise_slice)
+            else:
+                X_chunk = apply_augmentation(X_chunk, aug_config, generator)
+            ones = torch.ones((X_chunk.shape[0], 1), dtype=cdt, device=self.device)
+            X_chunk = torch.cat([ones, X_chunk], dim=1)
+        return X_chunk, Y_chunk
+
+    @staticmethod
+    def _apply_block_noise(X_feat, aug_config, noise):
+        """Apply pre-drawn noise rows (same math as the Augmentor classes)."""
+        sigma = aug_config["sigma"]
+        if aug_config["noise_type"] == "time":
+            return X_feat + sigma * noise
+        # freq (amplitude mode): scale rfft magnitudes by N(1, sigma)
+        X_freq = torch.fft.rfft(X_feat, dim=1)
+        X_freq = X_freq * (1.0 + sigma * noise)
+        return torch.fft.irfft(X_freq, n=X_feat.shape[1], dim=1)
 
     @torch.no_grad()
-    def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
+    def accumulate_gram(self, X_wins, Y_wins, scaler, aug_config, lo, hi,
+                        XTX=None, XTY=None, seed_ctx=None, block=8192):
+        """Accumulate Gram contributions of window rows [lo, hi) of each series
+        into XTX (F, F) and/or XTY (F, H), in place.
+
+        Chunks are aligned to fixed `block`-row boundaries in absolute row
+        index, and augmentation noise is drawn per (seed_ctx, series, block)
+        with full-block draws sliced to the covered rows — so the noise seen
+        by row i is identical no matter which prefix range builds it. That is
+        what makes cached prefix Grams extendable for noisy configurations,
+        and makes XTY passes consistent with the cached XTX.
+        """
+        if X_wins.dim() == 2:
+            X_wins = X_wins.unsqueeze(0)
+            Y_wins = Y_wins.unsqueeze(0)
+        S = X_wins.shape[0]
+        cdt = self.compute_dtype
+        adt = (XTX if XTX is not None else XTY).dtype
+        noisy = has_augmentation(aug_config)
+        use_local_norm = isinstance(scaler, LocalNormScaler)
+
+        with PROFILER.stage("gram"):
+            for s in range(S):
+                for b in range(lo // block * block, hi, block):
+                    r0, r1 = max(lo, b), min(hi, b + block)
+                    if r0 >= r1:
+                        continue
+                    X_chunk = X_wins[s, r0:r1].to(dtype=cdt, device=self.device,
+                                                  non_blocking=True)
+                    Y_chunk = Y_wins[s, r0:r1].to(dtype=cdt, device=self.device,
+                                                  non_blocking=True)
+
+                    noise_slice = None
+                    if noisy:
+                        # feature count the noise applies to (excludes the
+                        # appended scale feature / prepended intercept)
+                        Lf = X_chunk.shape[1]
+                        n_cols = (Lf // 2 + 1 if aug_config["noise_type"] == "freq"
+                                  else Lf)
+                        gen = torch.Generator(device=self.device)
+                        gen.manual_seed(_stable_seed(
+                            (seed_ctx, RUN_CONFIG["aug_base_seed"], s, b)))
+                        block_noise = torch.randn((block, n_cols), device=self.device,
+                                                  dtype=cdt, generator=gen)
+                        noise_slice = block_noise[r0 - b:r1 - b]
+
+                    X_chunk, Y_chunk = self._transform_train_chunk(
+                        X_chunk, Y_chunk, scaler, aug_config, cdt,
+                        noise_slice=noise_slice)
+
+                    if XTX is not None:
+                        gram = X_chunk.T @ X_chunk
+                        XTX.add_(gram if gram.dtype == adt else gram.to(adt))
+                    if XTY is not None:
+                        cross = X_chunk.T @ Y_chunk
+                        XTY.add_(cross if cross.dtype == adt else cross.to(adt))
+
+    @torch.no_grad()
+    def solve_from_gram(self, XTX, XTY, alphas, fit_intercept):
+        """Solve the regularized systems for every alpha from precomputed
+        Gram matrices (see accumulate_gram / GramCache)."""
+        with PROFILER.stage("solve"):
+            return self._solve_alpha_chunked(XTX, XTY, alphas, fit_intercept)
+
+    @torch.no_grad()
+    def solve(self, X_train, Y_train, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=None):
         """
         Solve ridge regression for multiple alpha values.
 
         Args:
-            X_train: (N, L) input features
-            Y_train: (N, H) targets
+            X_train: (N, L) or (S, N_s, L) input features (3D is treated as the
+                     pooled row-concatenation of the S series)
+            Y_train: (N, H) or (S, N_s, H) targets
             alphas: (K,) regularization strengths
             scaler: normalization scaler (LocalNormScaler or GlobalScaler or None)
                     - LocalNormScaler: per-sample normalization, appends scale feature, no intercept
@@ -266,8 +595,8 @@ class RidgeSolver:
         Returns:
             Theta: (K, F, H) weight matrices for each alpha
         """
-        N, L = X_train.shape
-        _, H = Y_train.shape
+        L = X_train.shape[-1]
+        H = Y_train.shape[-1]
         K = alphas.shape[0]
 
         # Determine feature dimension and intercept based on scaler type
@@ -279,73 +608,90 @@ class RidgeSolver:
             F = L + 1  # features + intercept
             fit_intercept = True
 
-        XTX = torch.zeros(F, F, device=self.device, dtype=dtype)
-        XTY = torch.zeros(F, H, device=self.device, dtype=dtype)
+        cdt, adt = self._dtypes(dtype)
+        XTX = torch.zeros(F, F, device=self.device, dtype=adt)
+        XTY = torch.zeros(F, H, device=self.device, dtype=adt)
+        aug_gen = self._aug_generator(aug_config)
 
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            X_chunk = X_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-            Y_chunk = Y_train[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+        with PROFILER.stage("gram"):
+            for X_chunk, Y_chunk in self._iter_row_chunks(X_train, Y_train, chunk_size):
+                X_chunk = X_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
 
-            if use_local_norm:
-                # LocalNormScaler: fit per-chunk, transform X (appends scale), transform target Y
-                scaler.fit(X_chunk)
-                X_chunk = scaler.transform(X_chunk)
-                Y_chunk = scaler.transform_target(Y_chunk)
-                # Data augmentation (on normalized features, excluding appended scale)
-                X_chunk_features = X_chunk[:, :-1]
-                X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
+                X_chunk, Y_chunk = self._transform_train_chunk(
+                    X_chunk, Y_chunk, scaler, aug_config, cdt, generator=aug_gen)
+
+                # Accumulate the gram matrix (per-chunk matmul in the compute
+                # dtype, accumulation in the higher-precision dtype)
+                if cdt == adt:
+                    XTX.add_(X_chunk.T @ X_chunk)
+                    XTY.add_(X_chunk.T @ Y_chunk)
+                else:
+                    XTX.add_((X_chunk.T @ X_chunk).to(adt))
+                    XTY.add_((X_chunk.T @ Y_chunk).to(adt))
+
+        with PROFILER.stage("solve"):
+            Theta = self._solve_alpha_chunked(XTX, XTY, alphas, fit_intercept)
+        return Theta
+
+    def _solve_alpha_chunked(self, XTX, XTY, alphas, fit_intercept, alpha_chunk_size=None):
+        """
+        Solve (XTX + alpha*D) Theta = XTY for every alpha, chunking over alphas
+        so the transient (Kb, ..., F, F) factorization workspace stays bounded
+        instead of materializing all K systems at once.
+
+        D = diag(0, 1, ..., 1) when fit_intercept else the identity.
+
+        Args:
+            XTX: (F, F) or (Sb, F, F) Gram matrices
+            XTY: (F, H) or (Sb, F, H) cross-products
+            alphas: (K,) regularization strengths
+
+        Returns:
+            Theta: (K, F, H) or (K, Sb, F, H), same device/dtype as XTY
+        """
+        K = alphas.shape[0]
+        F = XTX.shape[-1]
+        batched = XTX.dim() == 3
+        if alpha_chunk_size is None:
+            # ~1GB budget for A plus its Cholesky factor per chunk
+            n_systems = XTX.shape[0] if batched else 1
+            per_alpha = 2 * n_systems * F * F * XTX.element_size()
+            alpha_chunk_size = max(1, min(K, (1 << 30) // max(1, per_alpha)))
+
+        Theta = torch.empty((K,) + XTY.shape, device=XTY.device, dtype=XTY.dtype)
+        for k0 in range(0, K, alpha_chunk_size):
+            k1 = min(k0 + alpha_chunk_size, K)
+            alpha_chunk = alphas[k0:k1].to(device=XTX.device, dtype=XTX.dtype)
+            if batched:
+                diag_vals = alpha_chunk.view(-1, 1, 1).expand(k1 - k0, XTX.shape[0], F).clone()
+                if fit_intercept:
+                    diag_vals[:, :, 0] = 0.0  # don't regularize the intercept
             else:
-                # GlobalScaler or None: transform if scaler provided
-                if scaler is not None:
-                    X_chunk = scaler.transform(X_chunk)
-                    Y_chunk = scaler.transform(Y_chunk)
-                # Data augmentation
-                X_chunk = apply_augmentation(X_chunk, aug_config)
-                # Add intercept term
-                X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                diag_vals = alpha_chunk.view(-1, 1).expand(k1 - k0, F).clone()
+                if fit_intercept:
+                    diag_vals[:, 0] = 0.0
+            A = XTX.unsqueeze(0) + torch.diag_embed(diag_vals)
+            B = XTY.unsqueeze(0).expand((k1 - k0,) + XTY.shape)
 
-            # Accumulate the gram matrix
-            XTX.add_(X_chunk.T @ X_chunk)
-            XTY.add_(X_chunk.T @ Y_chunk)
-
-        XTX_expanded = XTX.unsqueeze(0).expand(K, -1, -1)
-
-        # Create regularization matrix
-        if fit_intercept:
-            # Don't regularize the intercept term
-            reg_diags = alphas.unsqueeze(1).expand(-1, F).clone()
-            reg_diags[:, 0] = 0.0
-        else:
-            # Regularize all features (LocalNormScaler case)
-            reg_diags = alphas.unsqueeze(1).expand(-1, F)
-        I_reg = torch.diag_embed(reg_diags)
-
-        A = XTX_expanded + I_reg
-        B = XTY.unsqueeze(0).expand(K, -1, -1)
-
-        # Solve Linear System
-        try:
-            Lchol = torch.linalg.cholesky(A)
-            Theta = torch.cholesky_solve(B, Lchol)  # (K, F, H)
-        except RuntimeError:
             try:
-                Theta = torch.linalg.solve(A, B)
+                Lchol = torch.linalg.cholesky(A)
+                Theta[k0:k1] = torch.cholesky_solve(B, Lchol)
             except RuntimeError:
-                XTX_inv = torch.linalg.pinv(A)
-                Theta = torch.einsum('kij,kjh->kih', XTX_inv, B)
-
-        torch.cuda.empty_cache()
+                try:
+                    Theta[k0:k1] = torch.linalg.solve(A, B)
+                except RuntimeError:
+                    Theta[k0:k1] = torch.linalg.pinv(A) @ B
         return Theta
 
     @torch.no_grad()
-    def predict(self, X, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def predict(self, X, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Make predictions using trained weights.
 
         Args:
-            X: (N, L) input features (raw, before any normalization)
+            X: (N, L) or (S, N_s, L) input features (raw, before any normalization);
+               3D input is consumed in series-major order and returned flattened
             theta: (K, F, H) weight matrices
             scaler: normalization scaler (LocalNormScaler or GlobalScaler or None)
                     - LocalNormScaler: fit, transform (appends scale), predict, inv_transform
@@ -355,41 +701,129 @@ class RidgeSolver:
             dtype: computation dtype
 
         Returns:
-            Y_pred: (K, N, H) predictions
+            Y_pred: (K, N_total, H) predictions on the solver device
         """
-        N = X.shape[0]
         K, _, H = theta.shape
+        dtype, _ = self._dtypes(dtype)
         theta = theta.to(dtype=dtype, device=self.device, non_blocking=True)
 
         use_local_norm = isinstance(scaler, LocalNormScaler)
 
         # Process in chunks for memory efficiency
-        Y_pred_chunks = []
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            X_chunk = X[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+        with PROFILER.stage("predict"):
+            Y_pred_chunks = []
+            for X_chunk, _ in self._iter_row_chunks(X, None, chunk_size):
+                X_chunk = X_chunk.to(dtype=dtype, device=self.device, non_blocking=True)
 
-            if use_local_norm:
-                # LocalNormScaler: fit, transform, predict, then inv_transform
-                scaler.fit(X_chunk)
-                X_transformed = scaler.transform(X_chunk)
-                Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta)
-                Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
-            else:
-                # GlobalScaler or None: add intercept and predict
-                if scaler is not None:
-                    X_chunk = scaler.transform(X_chunk)
-                ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
-                X_chunk = torch.cat([ones, X_chunk], dim=1)
-                Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta)
+                if use_local_norm:
+                    # LocalNormScaler: fit, transform, predict, then inv_transform
+                    scaler.fit(X_chunk)
+                    X_transformed = scaler.transform(X_chunk)
+                    Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta)
+                    Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
+                else:
+                    # GlobalScaler or None: add intercept and predict
+                    if scaler is not None:
+                        X_chunk = scaler.transform(X_chunk)
+                    ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+                    X_chunk = torch.cat([ones, X_chunk], dim=1)
+                    Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta)
 
-            Y_pred_chunks.append(Y_pred_chunk.cpu())
+                Y_pred_chunks.append(Y_pred_chunk)
 
-        Y_pred = torch.cat(Y_pred_chunks, dim=1).to(self.device)
+            Y_pred = torch.cat(Y_pred_chunks, dim=1)
         return Y_pred
 
+    def _predict_chunk(self, X_chunk, theta, scaler, dtype):
+        """Transform one raw (rows, L) chunk, apply theta, undo the normalization.
+
+        Unlike predict(), this also applies the GlobalScaler inverse so the
+        result is always in the original data scale.
+        """
+        if isinstance(scaler, LocalNormScaler):
+            scaler.fit(X_chunk)
+            X_t = scaler.transform(X_chunk)
+            pred = torch.einsum('nf, kfh -> knh', X_t, theta)
+            return scaler.inv_transform(pred)
+        if scaler is not None:
+            X_chunk = scaler.transform(X_chunk)
+        ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+        X_t = torch.cat([ones, X_chunk], dim=1)
+        pred = torch.einsum('nf, kfh -> knh', X_t, theta)
+        if isinstance(scaler, GlobalScaler):
+            pred = scaler.inv_transform(pred)
+        return pred
+
     @torch.no_grad()
-    def solve_batched(self, X_train_batch, Y_train_batch, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=torch.float64):
+    def val_mse(self, X, Y, theta, scaler=None, chunk_size=50000, dtype=None):
+        """
+        Fused validation MSE per alpha: prediction and squared error in one
+        chunked pass, never materializing the (K, N, H) prediction tensor and
+        never leaving the solver device until the final (K,) vector.
+
+        Equivalent to predict() -> inv_transform -> ((pred - Y)**2).mean((-2,-1)).
+
+        Args:
+            X: (N, L) or (S, N_s, L) raw validation inputs
+            Y: (N, H) or (S, N_s, H) raw validation targets
+            theta: (K, F, H) weight matrices
+
+        Returns:
+            mse_per_alpha: (K,) tensor on CPU
+        """
+        K = theta.shape[0]
+        H = Y.shape[-1]
+        cdt, adt = self._dtypes(dtype)
+        theta = theta.to(dtype=cdt, device=self.device, non_blocking=True)
+
+        sse = torch.zeros(K, device=self.device, dtype=adt)
+        n_rows = 0
+        with PROFILER.stage("predict"):
+            for X_chunk, Y_chunk in self._iter_row_chunks(X, Y, chunk_size):
+                X_chunk = X_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                Y_chunk = Y_chunk.to(dtype=cdt, device=self.device, non_blocking=True)
+                pred = self._predict_chunk(X_chunk, theta, scaler, cdt)
+                sse += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1), dtype=adt)
+                n_rows += X_chunk.shape[0]
+        return (sse / (n_rows * H)).cpu()
+
+    @torch.no_grad()
+    def val_mse_batched(self, X_batch, Y_batch, theta, scaler=None, chunk_size=50000, dtype=None):
+        """
+        Fused validation MSE for per-series models: per-series MSE averaged
+        across series, per alpha.
+
+        Equivalent to predict_batched() -> inv_transform ->
+        mean over (N, H) per series -> mean over series.
+
+        Args:
+            X_batch: (S, N_s, L) raw validation inputs
+            Y_batch: (S, N_s, H) raw validation targets
+            theta: (K, S, F, H) weight matrices
+
+        Returns:
+            mse_per_alpha: (K,) tensor on CPU
+        """
+        S, N_s, _ = X_batch.shape
+        K = theta.shape[0]
+        H = Y_batch.shape[-1]
+        cdt, adt = self._dtypes(dtype)
+
+        sse = torch.zeros(K, S, device=self.device, dtype=adt)
+        with PROFILER.stage("predict"):
+            for s in range(S):
+                theta_s = theta[:, s].to(dtype=cdt, device=self.device, non_blocking=True)
+                for start in range(0, N_s, chunk_size):
+                    end = min(start + chunk_size, N_s)
+                    X_chunk = X_batch[s, start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                    Y_chunk = Y_batch[s, start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                    pred = self._predict_chunk(X_chunk, theta_s, scaler, cdt)
+                    sse[:, s] += ((pred - Y_chunk.unsqueeze(0)) ** 2).sum(dim=(-2, -1), dtype=adt)
+        mse_per_series = sse / (N_s * H)  # (K, S)
+        return mse_per_series.mean(dim=1).cpu()
+
+    @torch.no_grad()
+    def solve_batched(self, X_train_batch, Y_train_batch, alphas, scaler=None, chunk_size=50000, aug_config=None, dtype=None):
         """
         Solve ridge regression for multiple series simultaneously (batched).
 
@@ -406,7 +840,7 @@ class RidgeSolver:
             dtype: computation dtype
 
         Returns:
-            Theta: (K, S, F, H) weight matrices on CPU
+            Theta: (K, S, F, H) weight matrices on the solver device
         """
         S, N_s, L = X_train_batch.shape
         _, _, H = Y_train_batch.shape
@@ -421,15 +855,17 @@ class RidgeSolver:
             F = L + 1  # features + intercept
             fit_intercept = True
 
-        # Theta on CPU — results are read by predict_batched which also works per-series
-        Theta = torch.zeros(K, S, F, H, dtype=dtype)
+        cdt, adt = self._dtypes(dtype)
+        Theta = torch.zeros(K, S, F, H, device=self.device, dtype=adt)
 
         # Determine series_batch: must fit Gram matrices + at least 1 alpha solve
         # Gram: Sb * (F*F + F*H) * 8 bytes for XTX + XTY
         # Solve (min): 1 * Sb * F*F * 8 * 3 bytes for A, L, workspace
-        torch.cuda.empty_cache()
-        free_mem, _ = torch.cuda.mem_get_info(self.device)
-        gpu_budget = int(free_mem * 0.7)
+        if self.device.type == "cuda":
+            free_mem, _ = torch.cuda.mem_get_info(self.device)
+            gpu_budget = int(free_mem * 0.7)
+        else:
+            gpu_budget = 4 << 30  # fixed working budget on CPU
         bytes_per_series = (F * F + F * H + F * F * 3) * 8  # Gram + 1-alpha solve
         series_batch = max(1, min(S, gpu_budget // bytes_per_series))
 
@@ -438,76 +874,41 @@ class RidgeSolver:
             Sb = s_end - s_start
 
             # --- Phase 1: Accumulate Gram matrices for this series batch ---
-            XTX = torch.zeros(Sb, F, F, device=self.device, dtype=dtype)
-            XTY = torch.zeros(Sb, F, H, device=self.device, dtype=dtype)
+            XTX = torch.zeros(Sb, F, F, device=self.device, dtype=adt)
+            XTY = torch.zeros(Sb, F, H, device=self.device, dtype=adt)
 
-            for si, s in enumerate(range(s_start, s_end)):
-                X_s = X_train_batch[s]  # (N_s, L)
-                Y_s = Y_train_batch[s]  # (N_s, H)
+            with PROFILER.stage("gram"):
+                for si, s in enumerate(range(s_start, s_end)):
+                    X_s = X_train_batch[s]  # (N_s, L)
+                    Y_s = Y_train_batch[s]  # (N_s, H)
+                    aug_gen = self._aug_generator(aug_config)
 
-                for start in range(0, N_s, chunk_size):
-                    end = min(start + chunk_size, N_s)
-                    X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
-                    Y_chunk = Y_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                    for start in range(0, N_s, chunk_size):
+                        end = min(start + chunk_size, N_s)
+                        X_chunk = X_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
+                        Y_chunk = Y_s[start:end].to(dtype=cdt, device=self.device, non_blocking=True)
 
-                    if use_local_norm:
-                        scaler.fit(X_chunk)
-                        X_chunk = scaler.transform(X_chunk)
-                        Y_chunk = scaler.transform_target(Y_chunk)
-                        X_chunk_features = X_chunk[:, :-1]
-                        X_chunk_features = apply_augmentation(X_chunk_features, aug_config)
-                        X_chunk = torch.cat([X_chunk_features, X_chunk[:, -1:]], dim=-1)
-                    else:
-                        if scaler is not None:
-                            X_chunk = scaler.transform(X_chunk)
-                            Y_chunk = scaler.transform(Y_chunk)
-                        X_chunk = apply_augmentation(X_chunk, aug_config)
-                        X_chunk = torch.cat([torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device), X_chunk], dim=1)
+                        X_chunk, Y_chunk = self._transform_train_chunk(
+                            X_chunk, Y_chunk, scaler, aug_config, cdt, generator=aug_gen)
 
-                    XTX[si].add_(X_chunk.T @ X_chunk)
-                    XTY[si].add_(X_chunk.T @ Y_chunk)
+                        if cdt == adt:
+                            XTX[si].add_(X_chunk.T @ X_chunk)
+                            XTY[si].add_(X_chunk.T @ Y_chunk)
+                        else:
+                            XTX[si].add_((X_chunk.T @ X_chunk).to(adt))
+                            XTY[si].add_((X_chunk.T @ Y_chunk).to(adt))
 
-            # --- Phase 2: Solve for all alphas, adaptively batched ---
-            # Re-query free memory after Gram allocation
-            torch.cuda.empty_cache()
-            free_mem2, _ = torch.cuda.mem_get_info(self.device)
-            solve_budget = int(free_mem2 * 0.7)
-            # Each alpha in this batch needs Sb * F * F * 8 * 3 bytes
-            solve_bytes_per_alpha = Sb * F * F * 8 * 3
-            alpha_batch = max(1, min(K, solve_budget // max(1, solve_bytes_per_alpha)))
-
-            for k_start in range(0, K, alpha_batch):
-                k_end = min(k_start + alpha_batch, K)
-                Kb = k_end - k_start
-                alpha_chunk = alphas[k_start:k_end]
-
-                diag_vals = alpha_chunk.view(Kb, 1, 1).expand(Kb, Sb, F).clone()
-                if fit_intercept:
-                    diag_vals[:, :, 0] = 0.0
-                I_reg = torch.diag_embed(diag_vals)
-
-                A = XTX.unsqueeze(0).expand(Kb, -1, -1, -1) + I_reg  # (Kb, Sb, F, F)
-                B = XTY.unsqueeze(0).expand(Kb, -1, -1, -1).clone()  # (Kb, Sb, F, H)
-
-                try:
-                    L = torch.linalg.cholesky(A)
-                    Theta[k_start:k_end, s_start:s_end] = torch.cholesky_solve(B, L).cpu()
-                except RuntimeError:
-                    try:
-                        Theta[k_start:k_end, s_start:s_end] = torch.linalg.solve(A, B).cpu()
-                    except RuntimeError:
-                        A_inv = torch.linalg.pinv(A)
-                        Theta[k_start:k_end, s_start:s_end] = torch.einsum('ksij,ksjh->ksih', A_inv, B).cpu()
-
-                del A, B, I_reg, diag_vals
+            # --- Phase 2: Solve for all alphas, chunked over alphas ---
+            with PROFILER.stage("solve"):
+                Theta[:, s_start:s_end] = self._solve_alpha_chunked(
+                    XTX, XTY, alphas, fit_intercept)
 
             del XTX, XTY
-            torch.cuda.empty_cache()
 
         return Theta
 
     @torch.no_grad()
-    def predict_batched(self, X_batch, theta, scaler=None, chunk_size=50000, dtype=torch.float64):
+    def predict_batched(self, X_batch, theta, scaler=None, chunk_size=50000, dtype=None):
         """
         Make predictions using batched trained weights (one model per series).
 
@@ -523,43 +924,44 @@ class RidgeSolver:
         """
         S, N_s, L = X_batch.shape
         K, _, _, H = theta.shape
-        # theta stays on CPU; load per-series to GPU to avoid large GPU allocation
+        dtype, _ = self._dtypes(dtype)
 
         use_local_norm = isinstance(scaler, LocalNormScaler)
 
         Y_pred_all = []
 
         # Process each series
-        for s in range(S):
-            X_s = X_batch[s]  # (N_s, L)
-            theta_s = theta[:, s, :, :].to(dtype=dtype, device=self.device, non_blocking=True)  # (K, F, H)
+        with PROFILER.stage("predict"):
+            for s in range(S):
+                X_s = X_batch[s]  # (N_s, L)
+                theta_s = theta[:, s, :, :].to(dtype=dtype, device=self.device, non_blocking=True)  # (K, F, H)
 
-            # Process in chunks for memory efficiency
-            Y_pred_chunks = []
-            for start in range(0, N_s, chunk_size):
-                end = min(start + chunk_size, N_s)
-                X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
+                # Process in chunks for memory efficiency
+                Y_pred_chunks = []
+                for start in range(0, N_s, chunk_size):
+                    end = min(start + chunk_size, N_s)
+                    X_chunk = X_s[start:end].to(dtype=dtype, device=self.device, non_blocking=True)
 
-                if use_local_norm:
-                    # LocalNormScaler: fit, transform, predict, then inv_transform
-                    scaler.fit(X_chunk)
-                    X_transformed = scaler.transform(X_chunk)
-                    Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta_s)
-                    Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
-                else:
-                    # GlobalScaler or None: add intercept and predict
-                    if scaler is not None:
-                        X_chunk = scaler.transform(X_chunk)
-                    ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
-                    X_chunk = torch.cat([ones, X_chunk], dim=1)
-                    Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta_s)
+                    if use_local_norm:
+                        # LocalNormScaler: fit, transform, predict, then inv_transform
+                        scaler.fit(X_chunk)
+                        X_transformed = scaler.transform(X_chunk)
+                        Y_pred_norm = torch.einsum('nf, kfh -> knh', X_transformed, theta_s)
+                        Y_pred_chunk = scaler.inv_transform(Y_pred_norm)
+                    else:
+                        # GlobalScaler or None: add intercept and predict
+                        if scaler is not None:
+                            X_chunk = scaler.transform(X_chunk)
+                        ones = torch.ones((X_chunk.shape[0], 1), dtype=dtype, device=self.device)
+                        X_chunk = torch.cat([ones, X_chunk], dim=1)
+                        Y_pred_chunk = torch.einsum('nf, kfh -> knh', X_chunk, theta_s)
 
-                Y_pred_chunks.append(Y_pred_chunk.cpu())
+                    Y_pred_chunks.append(Y_pred_chunk)
 
-            Y_pred_s = torch.cat(Y_pred_chunks, dim=1)  # (K, N_s, H)
-            Y_pred_all.append(Y_pred_s)
+                Y_pred_s = torch.cat(Y_pred_chunks, dim=1)  # (K, N_s, H)
+                Y_pred_all.append(Y_pred_s)
 
-        Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H) — stays on CPU
+            Y_pred = torch.stack(Y_pred_all, dim=1)  # (K, S, N_s, H)
         return Y_pred
 
 # ==========================================
@@ -568,10 +970,10 @@ class RidgeSolver:
 def get_context_and_horizons(data, lookback, horizons):
     if isinstance(horizons, int):
         H_max = horizons
-        idx_tensor = torch.tensor([horizons], dtype=torch.long)
+        idx_tensor = torch.tensor([horizons], dtype=torch.long, device=data.device)
     else:
         H_max = max(horizons)
-        idx_tensor = torch.tensor(horizons, dtype=torch.long)
+        idx_tensor = torch.tensor(horizons, dtype=torch.long, device=data.device)
 
     # Dynamic Window: lookback + max_horizon required
     window_size = lookback + H_max
@@ -632,9 +1034,12 @@ def maybe_transform(X: torch.Tensor, scaler, force_no_fit: bool = False):
 
 
 def get_prepared_data(series_data, lookback, horizons, split_idx_1, split_idx_2,
-                      scaler_config):
+                      scaler_config, include_val=True, include_test=True):
     """
     Prepare train/val/test data with appropriate scalers.
+
+    include_val/include_test skip building window sets the caller will not use
+    (fold evaluation never touches test windows; refit never touches val).
 
     Returns:
         X_train, Y_train, X_val, Y_val, X_test, Y_test, scalers_dict
@@ -654,15 +1059,18 @@ def get_prepared_data(series_data, lookback, horizons, split_idx_1, split_idx_2,
     X_train, Y_train = get_context_and_horizons(
         series_data[:, :split_idx_1], lookback, horizons)
 
-    if split_idx_2 > split_idx_1:
+    if include_val and split_idx_2 > split_idx_1:
         X_val, Y_val = get_context_and_horizons(
             series_data[:, split_idx_1 - lookback:split_idx_2],
             lookback, horizons)
     else:
         X_val, Y_val = None, None
 
-    X_test, Y_test = get_context_and_horizons(
-        series_data[:, test_slice_start:], lookback, horizons)
+    if include_test:
+        X_test, Y_test = get_context_and_horizons(
+            series_data[:, test_slice_start:], lookback, horizons)
+    else:
+        X_test, Y_test = None, None
 
     # Create scalers
     if scope == 'global':
@@ -690,7 +1098,7 @@ class SingleObjectiveWrapper:
                  n_folds=1, fold_reg_lambda=0.0,
                  scaler_scope="search", scaler_method="search",
                  fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                 pool_series=False):
+                 pool_series=False, precision="fp64", lookback_grid=False):
         """
         Args:
             data: (T, S) time series data
@@ -724,13 +1132,30 @@ class SingleObjectiveWrapper:
             self.data = data[:, series_idx].unsqueeze(0)
             self.is_batched = False
             self.n_series = 1
+        # Keep the (small) series data resident on the compute device so all
+        # windowing/unfold operations below are device-side views.
+        self.data = self.data.to(device).contiguous()
+
+        # Identity of this wrapper's data slice for GramCache keys, plus a
+        # memo of already-evaluated hyperparameter combinations (duplicate
+        # Optuna trials are common in categorical-heavy spaces).
+        if series_idx is None:
+            self._series_key = ("all",)
+        elif isinstance(series_idx, (list, tuple)):
+            self._series_key = tuple(series_idx)
+        else:
+            self._series_key = (series_idx,)
+        self._memo = {}
         # Store lookback bounds for log-scale search
         self.min_lookback = min(lookbacks)
         self.max_lookback = max(lookbacks)
+        # Sorted grid for the ordered-index space (--lookback_grid)
+        self.valid_lookbacks = sorted(int(lb) for lb in lookbacks)
+        self.lookback_grid = lookback_grid
         self.horizon = horizon
         self.alphas = alphas
         self.device = device
-        self.solver = RidgeSolver(device)
+        self.solver = RidgeSolver(device, precision=precision)
         self.n_folds = n_folds
         self.fold_reg_lambda = fold_reg_lambda
         self.pool_series = pool_series
@@ -777,9 +1202,11 @@ class SingleObjectiveWrapper:
             mse_per_alpha: (K,) tensor of MSE for each alpha, or None if fold is invalid
         """
         try:
-            X_train_w, Y_train, X_val_w, Y_val, _, _, scalers = \
-                get_prepared_data(self.data, lookback, self.horizon,
-                                  train_end, val_end, scaler_config)
+            with PROFILER.stage("prep"):
+                X_train_w, Y_train, X_val_w, Y_val, _, _, scalers = \
+                    get_prepared_data(self.data, lookback, self.horizon,
+                                      train_end, val_end, scaler_config,
+                                      include_test=False)
         except ValueError:
             return None
 
@@ -787,60 +1214,103 @@ class SingleObjectiveWrapper:
             return None
 
         if self.is_batched and not self.pool_series:
-            # Batched mode: keep series separate (S, N_s, L)
-            # X_train_w shape: (S, N_windows, L)
-            # Y_train shape: (S, N_windows, H)
-
-            # Solve with batched solver (each series gets own model)
+            # Batched mode: keep series separate (S, N_s, L), one model per
+            # series. Per-series (S, F, F) Gram stacks are too large to cache,
+            # so this path stays uncached.
             Theta = self.solver.solve_batched(
                 X_train_w, Y_train, self.alphas,
                 scaler=scalers['train'],
                 aug_config=aug_config
             )  # (K, S, F, H)
 
-            # Predict per-series (returns CPU tensor to avoid OOM)
-            Y_pred = self.solver.predict_batched(
-                X_val_w, Theta, scaler=scalers['val']
-            )  # (K, S, N_val, H) on CPU
-
-            if isinstance(scalers['val'], GlobalScaler):
-                Y_pred = scalers['val'].inv_transform(Y_pred)
-
-            # Compute MSE on CPU to avoid large GPU allocation
-            # Y_val shape: (S, N_val, H)
-            # Y_pred shape: (K, S, N_val, H)
-            diff = Y_pred - Y_val.cpu().unsqueeze(0)  # (K, S, N_val, H)
-            mse_per_series = (diff ** 2).mean(dim=(-2, -1))  # (K, S)
-            mse_per_alpha = mse_per_series.mean(dim=1)  # (K,) - average across series
+            # Fused per-series validation MSE (never materializes predictions)
+            mse_per_alpha = self.solver.val_mse_batched(
+                X_val_w, Y_val, Theta, scaler=scalers['val'])  # (K,)
         else:
-            # Single series mode: concatenate windows
-            X_train = X_train_w.reshape(-1, lookback)
-            Y_train = Y_train.reshape(-1, Y_train.shape[-1])
-            X_val = X_val_w.reshape(-1, lookback)
-            Y_val = Y_val.reshape(-1, Y_val.shape[-1])
-
-            # Solve
-            Theta = self.solver.solve(
-                X_train, Y_train, self.alphas,
-                scaler=scalers['train'],
-                aug_config=aug_config
-            )
-
-            # Predict
-            Y_pred = self.solver.predict(X_val, Theta, scaler=scalers['val'])
-            if isinstance(scalers['val'], GlobalScaler):
-                Y_pred = scalers['val'].inv_transform(Y_pred)
-            Y_pred = Y_pred.cpu()
-
-            # Compute MSE per alpha
-            diff = Y_pred - Y_val.unsqueeze(0)  # (K, N_window, H)
-            mse_per_alpha = (diff ** 2).mean(dim=(-2, -1))  # (K,)
+            # Single-series / pooled mode: one model over the pooled window
+            # rows — served from prefix-Gram checkpoints when cached
+            mse_per_alpha = self._eval_fold_from_gram(
+                X_train_w, Y_train, X_val_w, Y_val, scalers,
+                scaler_config, aug_config, lookback, train_end)
 
         return mse_per_alpha
 
+    def _theta_from_gram(self, X_train_w, Y_train, scaler_train,
+                         scaler_config, aug_config, lookback, train_end, alphas):
+        """Pooled/single-series ridge weights through the GramCache.
+
+        XTX depends only on (series, lookback, transform, noise) and the row
+        cutoff — folds, horizon groups, and the refit split are nested
+        prefixes of the same window sequence — so it is cached across trials,
+        folds, horizon-group studies, and the refit stage. XTY additionally
+        depends on the horizon tuple (a few columns) and gets its own entries.
+        """
+        if X_train_w.dim() == 2:
+            X_train_w = X_train_w.unsqueeze(0)
+            Y_train = Y_train.unsqueeze(0)
+        n_rows = X_train_w.shape[1]
+        H = Y_train.shape[-1]
+        F = lookback + 1  # + scale feature (local) or intercept (global)
+        use_local_norm = isinstance(scaler_train, LocalNormScaler)
+
+        if use_local_norm:
+            # per-window transform: prefix-safe across folds
+            xform_key = ("local", scaler_config["method"], scaler_train.last_k)
+        else:
+            # global scaler stats are fit on [:train_end] — fold-dependent,
+            # so entries are only shared within a fold (still across the
+            # horizon-group studies and duplicate trials)
+            xform_key = ("global", scaler_config["method"], train_end)
+        if has_augmentation(aug_config):
+            aug_key = (aug_config["noise_type"], round(float(aug_config["sigma"]), 9))
+        else:
+            aug_key = ("clean",)
+        base_key = (self._series_key, self.pool_series, lookback, xform_key, aug_key)
+        adt = self.solver.accum_dtype
+
+        def make_xtx():
+            return torch.zeros(F, F, device=self.device, dtype=adt)
+
+        def extend_xtx(acc, lo, hi):
+            self.solver.accumulate_gram(X_train_w, Y_train, scaler_train,
+                                        aug_config, lo, hi, XTX=acc,
+                                        seed_ctx=base_key)
+
+        def make_xty():
+            return torch.zeros(F, H, device=self.device, dtype=adt)
+
+        def extend_xty(acc, lo, hi):
+            self.solver.accumulate_gram(X_train_w, Y_train, scaler_train,
+                                        aug_config, lo, hi, XTY=acc,
+                                        seed_ctx=base_key)
+
+        horizon_t = (tuple(self.horizon) if isinstance(self.horizon, (list, tuple))
+                     else (self.horizon,))
+        XTX = GRAM_CACHE.get_or_build(("xtx",) + base_key, n_rows,
+                                      make_xtx, extend_xtx)
+        XTY = GRAM_CACHE.get_or_build(("xty",) + base_key + (horizon_t,), n_rows,
+                                      make_xty, extend_xty)
+
+        return self.solver.solve_from_gram(XTX, XTY, alphas,
+                                           fit_intercept=not use_local_norm)
+
+    def _eval_fold_from_gram(self, X_train_w, Y_train, X_val_w, Y_val, scalers,
+                             scaler_config, aug_config, lookback, train_end):
+        Theta = self._theta_from_gram(X_train_w, Y_train, scalers['train'],
+                                      scaler_config, aug_config, lookback,
+                                      train_end, self.alphas)
+        return self.solver.val_mse(X_val_w, Y_val, Theta, scaler=scalers['val'])
+
     def __call__(self, trial):
-        # Suggest lookback using log-scale search (more efficient for context length)
-        lookback = trial.suggest_int("lookback", self.min_lookback, self.max_lookback, log=True)
+        if self.lookback_grid:
+            # Ordered integer index over the sorted lookback grid: keeps TPE's
+            # ordinal modeling (unlike a categorical) while making the space
+            # finite, so the memo/GramCache converge most trials to ~free
+            lb_idx = trial.suggest_int("lookback_idx", 0, len(self.valid_lookbacks) - 1)
+            lookback = self.valid_lookbacks[lb_idx]
+        else:
+            # Suggest lookback using log-scale search (more efficient for context length)
+            lookback = trial.suggest_int("lookback", self.min_lookback, self.max_lookback, log=True)
 
         # Scaler scope (global vs local)
         if self.scaler_scope == "search":
@@ -884,28 +1354,43 @@ class SingleObjectiveWrapper:
                 sigma = trial.suggest_float("aug_sigma", 1e-3, 0.5, log=True)
         aug_config = {"noise_type": noise_type, "sigma": sigma}
 
+        # Exact-duplicate trials (common with categorical-heavy spaces and
+        # shared startup trials) are answered from a memo without recompute.
+        memo_key = (lookback, scaler_config["scope"], scaler_config["method"],
+                    round(scaler_config["local_ratio"], 12),
+                    aug_config["noise_type"], round(aug_config["sigma"], 12))
+
         if self.n_folds == 1:
             # Single split evaluation
-            mse_per_alpha = self._evaluate_fold(
-                self.split_idx_1, self.split_idx_2, scaler_config, aug_config, lookback)
+            if memo_key in self._memo:
+                mse_per_alpha = self._memo[memo_key]
+            else:
+                mse_per_alpha = self._evaluate_fold(
+                    self.split_idx_1, self.split_idx_2, scaler_config, aug_config, lookback)
+                self._memo[memo_key] = mse_per_alpha
             if mse_per_alpha is None:
                 raise optuna.TrialPruned()
         else:
             # Expanding window k-fold CV
-            fold_mses = []
-            for fold_idx in range(self.n_folds):
-                train_end = self.fold_boundaries[fold_idx]
-                val_end = self.fold_boundaries[fold_idx + 1]
-                mse = self._evaluate_fold(
-                    train_end, val_end, scaler_config, aug_config, lookback)
-                if mse is not None:
-                    fold_mses.append(mse)
+            if memo_key in self._memo:
+                fold_mses_tensor = self._memo[memo_key]
+            else:
+                fold_mses = []
+                for fold_idx in range(self.n_folds):
+                    train_end = self.fold_boundaries[fold_idx]
+                    val_end = self.fold_boundaries[fold_idx + 1]
+                    mse = self._evaluate_fold(
+                        train_end, val_end, scaler_config, aug_config, lookback)
+                    if mse is not None:
+                        fold_mses.append(mse)
+                # Stack fold MSEs: (n_folds, K)
+                fold_mses_tensor = torch.stack(fold_mses) if fold_mses else None
+                self._memo[memo_key] = fold_mses_tensor
 
-            if not fold_mses:
+            if fold_mses_tensor is None:
                 raise optuna.TrialPruned()
 
-            # Stack fold MSEs: (n_folds, K)
-            fold_mses_tensor = torch.stack(fold_mses)
+            fold_mses = fold_mses_tensor  # (n_valid_folds, K)
             mean_mse = fold_mses_tensor.mean(dim=0)  # (K,)
 
             # Apply fold variance regularization if lambda > 0
@@ -924,6 +1409,7 @@ class SingleObjectiveWrapper:
         best_val_mse, best_idx = torch.min(mse_per_alpha, dim=0)
 
         trial.set_user_attr("best_alpha", self.alphas[best_idx].item())
+        trial.set_user_attr("mse_per_alpha", mse_per_alpha.tolist())
         return best_val_mse.item()
 
     def refit_test(self, best_params, best_alpha_val, use_train_val=False):
@@ -974,51 +1460,57 @@ class SingleObjectiveWrapper:
         end = self.split_ends[1]
         X_train_w, Y_train, _, _, X_test_w, Y_test, scalers = \
             get_prepared_data(self.data, lookback, self.horizon,
-                              start, end, scaler_config)
+                              start, end, scaler_config, include_val=False)
 
         S = self.n_series
         N_test = X_test_w.shape[1] if X_test_w.dim() == 3 else X_test_w.shape[0]
 
-        X_train = X_train_w.reshape(-1, lookback)
-        Y_train = Y_train.reshape(-1, Y_train.shape[-1])
-        X_test = X_test_w.reshape(-1, lookback)
+        # Y windows are contiguous, so this reshape is a view; X windows stay
+        # 3D and are consumed chunk-wise by the solver without flattening.
         Y_test = Y_test.reshape(-1, Y_test.shape[-1])
 
         single_alpha = torch.tensor([best_alpha_val], device=self.device)
 
-        # Solve with scaler
-        Theta = self.solver.solve(
-            X_train, Y_train, single_alpha,
-            scaler=scalers['test'],
-            aug_config=aug_config,
-        )
+        # Solve with scaler. The pooled/single path goes through the GramCache:
+        # refit training windows are a prefix of the same window sequence the
+        # search evaluated, so this extends existing checkpoints.
+        if self.is_batched and not self.pool_series:
+            Theta = self.solver.solve(
+                X_train_w, Y_train, single_alpha,
+                scaler=scalers['test'],
+                aug_config=aug_config,
+            )
+        else:
+            Theta = self._theta_from_gram(
+                X_train_w, Y_train, scalers['test'],
+                scaler_config, aug_config, lookback, start, single_alpha)
 
         # Predict with scaler
-        Y_pred = self.solver.predict(X_test, Theta, scaler=scalers['test'])
+        Y_pred = self.solver.predict(X_test_w, Theta, scaler=scalers['test'])
         Y_pred = Y_pred.reshape_as(Y_test)  # (S*N_test, H) or (N_test, H)
 
         # For GlobalScaler, apply inv_transform to get back to original scale
         if isinstance(scalers['test'], GlobalScaler):
             Y_pred = scalers['test'].inv_transform(Y_pred)
-        Y_pred = Y_pred.to(torch.float32).cpu()
+        Y_pred = Y_pred.to(torch.float32)
 
         if self.pool_series and self.is_batched:
             # Reshape to per-series: (S*N_test, H) -> (S, N_test, H)
             H = Y_pred.shape[-1]
             Y_pred = Y_pred.reshape(S, N_test, H)
             Y_test_per = Y_test.reshape(S, N_test, H)
-            per_series_mse = ((Y_pred - Y_test_per)**2).mean(dim=(-2, -1))  # (S,)
+            per_series_mse = ((Y_pred - Y_test_per)**2).mean(dim=(-2, -1)).cpu()  # (S,)
             return {
                 'test_mse': per_series_mse.mean().item(),
                 'per_series_mse': per_series_mse,  # (S,)
-                'raw_preds': Y_pred,  # (S, N_test, H)
+                'raw_preds': Y_pred.cpu(),  # (S, N_test, H)
             }
 
         # Calculate simple mean for logging
         mse = ((Y_pred - Y_test)**2).mean().item()
         return {
             'test_mse': mse,
-            'raw_preds': Y_pred,
+            'raw_preds': Y_pred.cpu(),
         }
 
 class MultiOutputGlobalSeriesObjectiveWrapper:
@@ -1034,7 +1526,7 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
             device: torch device
             use_local_norm: if True, use LocalNormScaler (default True for reference compatibility)
         """
-        self.data = data
+        self.data = data.to(device)
         self.lookback = lookback
         self.horizon = horizons
         self.alphas = alphas
@@ -1059,12 +1551,13 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
         else:
             scaler = None  # No scaler, use intercept
 
-        # Create training windows
+        # Create training windows (device-side views; the solver consumes the
+        # 3D windows chunk-wise without materializing a flattened copy)
         train_wins = self.data[:n_train].transpose(0, 1).unfold(1, L + max_horizon, 1)
         # train_wins shape: (S, N_train_windows, L + max_horizon)
 
-        X_tr = train_wins[:, :, :L].reshape(-1, L)  # (S*N, L)
-        Y_tr = train_wins[:, :, L:L+H].reshape(-1, H)  # (S*N, H)
+        X_tr = train_wins[:, :, :L]  # (S, N, L)
+        Y_tr = train_wins[:, :, L:L+H]  # (S, N, H)
 
         # Solve ridge regression using unified solver
         single_alpha = torch.tensor([self.alphas], device=self.device)
@@ -1079,8 +1572,7 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
         N_test = test_wins.shape[1]
 
         # Predict using unified solver
-        X_te_flat = X_te.reshape(-1, L)  # (S*N_test, L)
-        Y_pred = self.solver.predict(X_te_flat, Theta, scaler=scaler)
+        Y_pred = self.solver.predict(X_te, Theta, scaler=scaler)
 
         # Reshape to (S, N_test, H)
         Y_pred = Y_pred.squeeze(0).reshape(S, N_test, H)
@@ -1091,16 +1583,91 @@ class MultiOutputGlobalSeriesObjectiveWrapper:
 # ==========================================
 # 6. Main Loop
 # ==========================================
+class TrialLogWriter:
+    """Appends one CSV row per finished Optuna trial (used by scripts/bench_parity.py)."""
+
+    FIELDS = ["study", "trial", "state", "value", "duration_s", "best_alpha",
+              "params", "mse_per_alpha"]
+
+    def __init__(self, path):
+        self.path = path
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(self.path, "w", newline="") as f:
+            csv.writer(f).writerow(self.FIELDS)
+
+    def callback(self, study_key):
+        def _cb(study, trial):
+            row = [
+                study_key,
+                trial.number,
+                trial.state.name,
+                "" if trial.value is None else repr(trial.value),
+                "" if trial.duration is None else f"{trial.duration.total_seconds():.4f}",
+                repr(trial.user_attrs["best_alpha"]) if "best_alpha" in trial.user_attrs else "",
+                json.dumps(trial.params, sort_keys=True),
+                json.dumps(trial.user_attrs.get("mse_per_alpha", [])),
+            ]
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+        return _cb
+
+
+def build_startup_trials(n_startup, valid_lookbacks, scaler_scope, scaler_method,
+                         fixed_local_ratio, fixed_noise_type, fixed_aug_sigma,
+                         lookback_grid):
+    """Deterministic grid-spanning startup configurations.
+
+    Enqueued into every horizon-group study of a series group: the first
+    evaluations of studies 2..N then hit GramCache entries built by study 1
+    (XTX is horizon-independent), and every study's TPE starts from identical,
+    informative coverage of the lookback grid — with or without --seed.
+    Noise is left off (searched configs) so the entries stay clean-keyed.
+    """
+    if n_startup <= 0:
+        return []
+    lbs = sorted(int(lb) for lb in valid_lookbacks)
+    idxs = sorted({round(i * (len(lbs) - 1) / max(1, n_startup - 1))
+                   for i in range(n_startup)})
+    local_ratios = [1.0, 0.1, 0.01]
+    trials = []
+    for j, li in enumerate(idxs):
+        params = {}
+        if lookback_grid:
+            params["lookback_idx"] = li
+        else:
+            params["lookback"] = lbs[li]
+        scope = scaler_scope if scaler_scope != "search" else \
+            ("local" if j % 2 == 0 else "global")
+        if scaler_scope == "search":
+            params["scaler_scope"] = scope
+        if scaler_method == "search":
+            params["scaler_method"] = "mean" if (j // 2) % 2 == 0 else "robust"
+        if scope == "local" and fixed_local_ratio is None:
+            params["local_ratio"] = local_ratios[j % len(local_ratios)]
+        if fixed_noise_type is None:
+            params["noise_type"] = "none"
+        elif fixed_noise_type != "none" and fixed_aug_sigma is None:
+            params["aug_sigma"] = 0.02
+        trials.append(params)
+    return trials
+
+
 def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trials, device,
                         horizon_group_size=1, series_group_size=1,
                         search_train_ratio=0.4, search_test_ratio=0.2,
                         split_starts=None, split_ends=None, n_folds=1, fold_reg_lambda=0.0,
                         scaler_scope="search", scaler_method="search",
                         fixed_local_ratio=None, fixed_noise_type=None, fixed_aug_sigma=None,
-                        pool_series=False, seed=None):
+                        pool_series=False, seed=None, precision="fp64",
+                        lookback_grid=False, shared_startup=True,
+                        horizon_group_subset=None, trial_log=None):
     best_results = []
     raw_results = {}  # Storage for alignment
     T, S = data.shape
+
+    trial_log_writer = TrialLogWriter(trial_log) if trial_log else None
 
     # Handle special value: -1 means all series
     if series_group_size <= 0:
@@ -1109,6 +1676,13 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
     # Valid lookback calculation
     valid_lookbacks = [int(lb) for lb in lookbacks if lb < int(T * 0.3) - max(horizons)]
     print(f"Valid Lookbacks: {valid_lookbacks}")
+    sorted_lookbacks = sorted(valid_lookbacks)
+
+    startup_trials = []
+    if shared_startup:
+        startup_trials = build_startup_trials(
+            min(10, n_trials // 2), valid_lookbacks, scaler_scope, scaler_method,
+            fixed_local_ratio, fixed_noise_type, fixed_aug_sigma, lookback_grid)
 
     # Timing statistics
     search_times = []
@@ -1122,7 +1696,9 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                          else f"[{series_names_in_group[0]}..{series_names_in_group[-1]}]")
         print(f"\n[Series Group: {group_display}]")
 
-        for h_idx in range(0, len(horizons), horizon_group_size):
+        for group_idx, h_idx in enumerate(range(0, len(horizons), horizon_group_size)):
+            if horizon_group_subset is not None and group_idx not in horizon_group_subset:
+                continue
             horizon_group = horizons[h_idx:h_idx + horizon_group_size]
 
             # HP Search: use series group (grouped objective for robust HP selection)
@@ -1137,16 +1713,27 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                 scaler_scope=scaler_scope, scaler_method=scaler_method,
                 fixed_local_ratio=fixed_local_ratio, fixed_noise_type=fixed_noise_type,
                 fixed_aug_sigma=fixed_aug_sigma,
-                pool_series=pool_series)
+                pool_series=pool_series, precision=precision,
+                lookback_grid=lookback_grid)
+
+            # Shared deterministic startup: identical first evaluations across
+            # all horizon-group studies -> GramCache hits from study 2 on
+            for startup_params in startup_trials:
+                study.enqueue_trial(startup_params)
 
             # Time the optimization
+            callbacks = ([trial_log_writer.callback(f"sg{sg_idx}_hg{group_idx}")]
+                         if trial_log_writer else None)
             search_start = time.time()
-            study.optimize(wrap, n_trials=n_trials)
+            study.optimize(wrap, n_trials=n_trials, callbacks=callbacks)
             search_elapsed = time.time() - search_start
             search_times.append(search_elapsed)
 
             # Extract best results from study
-            params = study.best_trial.params
+            params = dict(study.best_trial.params)
+            if "lookback_idx" in params:
+                # resolve the ordered-index space back to an actual lookback
+                params["lookback"] = sorted_lookbacks[params["lookback_idx"]]
             noise_type = params.get('noise_type', 'none')
             aug_sigma = params.get('aug_sigma', 0.0) if noise_type != 'none' else 0.0
             local_ratio = params.get('local_ratio', fixed_local_ratio if fixed_local_ratio else 1.0)
@@ -1184,7 +1771,7 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                         split_starts=split_starts, split_ends=split_ends,
                         scaler_scope=scaler_scope, scaler_method=scaler_method,
                         fixed_local_ratio=fixed_local_ratio, fixed_noise_type=fixed_noise_type,
-                        fixed_aug_sigma=fixed_aug_sigma)
+                        fixed_aug_sigma=fixed_aug_sigma, precision=precision)
                     metrics = refitter.refit_test(best['params'], best['best_alpha'])
 
                     # Save Raw Vectors
@@ -1206,6 +1793,11 @@ def search_local_models(data, series_names, lookbacks, horizons, alphas, n_trial
                   f"α={best['best_alpha']:.2e}, scaler={best['scaler_scope']}, "
                   f"norm={best['scaler_method']}, {aug_str}. "
                   f"Val={best['val_mse']:.4f}, Time={search_elapsed:.2f}s")
+
+        # Release cached allocator blocks once per series group (per-solve
+        # empty_cache calls were removed — they forced a device sync each fit)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Print timing summary
     total_elapsed = time.time() - total_start_time
@@ -1317,6 +1909,38 @@ def main():
                             help="Fix lookback to a single value instead of searching")
         parser.add_argument("--seed", type=int, default=None,
                             help="Seed for numpy/torch and Optuna TPE sampler (for multi-seed runs)")
+
+        # Performance controls
+        parser.add_argument("--precision", type=str, default="fp64",
+                            choices=["fp64", "mixed", "fp32"],
+                            help="Solver precision for the local-model search: fp64 (exact, "
+                                 "default), mixed (fp32 Gram matmuls, fp64 accumulate/solve), "
+                                 "or fp32. The global baseline always runs fp64.")
+        parser.add_argument("--tf32", action="store_true", default=False,
+                            help="Allow TF32 tensor-core matmuls (only affects fp32 compute)")
+        parser.add_argument("--cache_gb", type=float, default=4.0,
+                            help="GramCache budget in GiB (prefix-Gram checkpoints shared "
+                                 "across trials, folds, and horizon-group studies)")
+        parser.add_argument("--no_cache", action="store_true", default=False,
+                            help="Disable the GramCache (Grams are rebuilt every evaluation)")
+        parser.add_argument("--cache_verify", type=float, default=0.0,
+                            help="Fraction of cache hits to re-verify from scratch (debug)")
+        parser.add_argument("--lookback_grid", action="store_true", default=False,
+                            help="Search lookback as an ordered index over the discrete grid "
+                                 "instead of a continuous log-int (finite space, max cache "
+                                 "reuse; changes the search space)")
+        parser.add_argument("--no_shared_startup", action="store_true", default=False,
+                            help="Disable the shared deterministic startup trials that are "
+                                 "enqueued into every horizon-group study")
+
+        # Debug/benchmark controls (scripts/bench_parity.py)
+        parser.add_argument("--horizon_subset", type=str, default=None,
+                            help="Comma-separated horizon-group indices to search (debug/benchmark; "
+                                 "skips the global baseline and alignment stages)")
+        parser.add_argument("--trial_log", type=str, default=None,
+                            help="Path to a CSV logging every finished Optuna trial")
+        parser.add_argument("--profile", action="store_true", default=False,
+                            help="Record coarse per-stage timings (adds CUDA syncs; benchmark only)")
         args = parser.parse_args()
 
         if args.seed is not None:
@@ -1327,6 +1951,19 @@ def main():
 
         os.makedirs(args.output_dir, exist_ok=True)
         DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if args.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        RUN_CONFIG["aug_base_seed"] = args.seed if args.seed is not None else 0
+        GRAM_CACHE.max_bytes = int(args.cache_gb * (1 << 30))
+        GRAM_CACHE.enabled = not args.no_cache
+        GRAM_CACHE.verify_frac = args.cache_verify
+
+        PROFILER.enabled = args.profile
+        horizon_subset = (set(int(i) for i in args.horizon_subset.split(","))
+                          if args.horizon_subset else None)
 
         # Config
         if args.fixed_lookback is not None:
@@ -1383,9 +2020,25 @@ def main():
             scaler_scope=args.scaler_scope, scaler_method=args.scaler_method,
             fixed_local_ratio=args.fixed_local_ratio, fixed_noise_type=args.fixed_noise_type,
             fixed_aug_sigma=args.fixed_aug_sigma,
-            pool_series=args.pool_series, seed=args.seed
+            pool_series=args.pool_series, seed=args.seed, precision=args.precision,
+            lookback_grid=args.lookback_grid, shared_startup=not args.no_shared_startup,
+            horizon_group_subset=horizon_subset, trial_log=args.trial_log
         )
         pd.DataFrame(best_df).to_csv(f"{args.output_dir}/local_results.csv", index=False)
+
+        if args.profile:
+            profile = PROFILER.report()
+            profile["gram_cache"] = GRAM_CACHE.stats()
+            with open(os.path.join(args.output_dir, "profile.json"), "w") as f:
+                json.dump(profile, f, indent=2)
+            for name, rec in profile.items():
+                print(f"  [profile] {name}: {rec}")
+
+        if horizon_subset is not None:
+            # Debug/benchmark mode: the remaining stages need every horizon group.
+            print(f"--horizon_subset set; skipping global baseline and alignment stages.")
+            return
+
         local_raw = []
         for h_idx in range(0, len(HORIZONS), HORIZON_GROUP_SIZE):
             horizon_group = HORIZONS[h_idx:h_idx + HORIZON_GROUP_SIZE]

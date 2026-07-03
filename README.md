@@ -93,6 +93,44 @@ python optuna_ridge.py \
 | `--fixed_noise_type` | `None` | Fix augmentation: `none`, `time`, `freq`, or `None` (search) |
 | `--fixed_aug_sigma` | `None` | Fix augmentation intensity (disables search) |
 
+### Performance Controls
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--precision` | `fp64` | Solver precision: `fp64` (exact), `mixed` (fp32 Gram matmuls, fp64 accumulate/solve — the big win on GPUs with slow fp64), `fp32` |
+| `--tf32` | `False` | Allow TF32 tensor-core matmuls (only affects fp32 compute) |
+| `--cache_gb` | `4.0` | GramCache budget (GiB). XᵀX/XᵀY prefix checkpoints are shared across trials, expanding-window folds, and horizon-group studies |
+| `--no_cache` | `False` | Disable the GramCache (every evaluation rebuilds its Grams) |
+| `--cache_verify` | `0.0` | Recompute this fraction of cache hits from scratch and assert agreement (debug) |
+| `--lookback_grid` | `False` | Search lookback as an **ordered index** over the 19-value grid instead of a continuous log-int. Keeps TPE's ordinal modeling (unlike a categorical) while making the space finite for maximal cache/memo reuse; changes the search space |
+| `--no_shared_startup` | `False` | Disable the deterministic startup trials enqueued into every horizon-group study. Shared startups give each study identical grid-spanning first evaluations whose Gram work is computed once and reused across all studies |
+
+`fp64` reproduces the paper numerics exactly. `mixed` computes the O(N·F²)
+Gram matmuls in fp32 and everything conditioning-sensitive (accumulation,
+Cholesky, weights) in fp64; validate it for your dataset with
+`scripts/bench_parity.py compare <fp64_run> <mixed_run> --tol 1e-3 --alpha_match 0.95 --msepa_tol 1`.
+The global baseline always runs fp64.
+
+### Benchmark / Debug Controls
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--trial_log` | `None` | Write one CSV row per finished Optuna trial (params, val MSE, per-alpha MSE) |
+| `--profile` | `False` | Record coarse per-stage timings (prep/gram/solve/predict) to `profile.json`; adds CUDA syncs |
+| `--horizon_subset` | `None` | Comma-separated horizon-group indices to search; skips the global baseline and alignment stages |
+
+`scripts/bench_parity.py` drives these for performance work: `run` executes a
+reduced representative slice and records wall time + per-trial results,
+`compare` checks two runs for val-MSE / chosen-alpha parity, and `selftest`
+runs numerical unit checks on the solver and data pipeline.
+
+**Augmentation noise is seeded.** Noise draws are a deterministic function of
+(`--seed`, augmentation config, series, window row), so runs with the same
+seed reproduce exactly (previously augmentation used unseeded `randn_like`,
+making `--seed` runs irreproducible) and cached Gram matrices remain valid for
+noisy configurations. Noisy-trial results therefore differ from historical
+(pre-seeding) runs, which were not reproducible to begin with.
+
 ## Architecture
 
 ### Data Pipeline
